@@ -48,3 +48,28 @@ git add Formula/squawk.rb && git commit -m "squawk 0.1.0" && git push
 
 Optional later automation: a GitHub Actions release workflow that computes the
 sha and opens the tap PR automatically. Not built yet.
+
+## TCC re-prompts across builds
+
+`build.sh` ad-hoc-signs with the fixed identifier `sh.squawk.ptt`, but macOS
+keys an ad-hoc app's privacy grants to its **CDHash**, which tracks the
+compiled bytes. Measured on 2026-07-25:
+
+- The build is **deterministic** within one toolchain — same source compiled
+  from different directories into different output paths produced an identical
+  CDHash.
+- Homebrew's build differs from a plain `clang` build. The same source built
+  under `brew install` and by hand produced binaries of identical size but
+  9078 differing bytes, and therefore different CDHashes — Homebrew's
+  `superenv` clang shim injects its own flags/SDK paths.
+
+Practical consequences:
+
+- A user migrating from the hand-run `helper/install.sh` to `brew install`
+  **will** be re-prompted for Microphone / Accessibility / Input Monitoring
+  once, even though the identifier is unchanged.
+- `brew upgrade` re-prompts only when the helper source actually changes (or
+  Homebrew's toolchain does); a rebuild of unchanged source under the same
+  Homebrew environment yields the same CDHash and keeps the grants.
+
+Call this out in release notes for any version that touches `squawkptt.m`.

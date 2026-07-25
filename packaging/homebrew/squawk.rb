@@ -7,10 +7,10 @@ class Squawk < Formula
   sha256 "0000000000000000000000000000000000000000000000000000000000000000"
   license "MIT"
 
-  depends_on "sox"
-  depends_on :macos
-  # clang / Command Line Tools compile the helper during install.
+  # xcode (clang / Command Line Tools) compiles the helper during install.
   depends_on xcode: :build
+  depends_on :macos
+  depends_on "sox"
 
   def install
     # CLI: a single stdlib-only Python script (no pip, no framework).
@@ -19,9 +19,12 @@ class Squawk < Formula
     # Build SquawkPTT.app from source locally. Building on the user's machine is
     # deliberate: a locally compiled binary carries no Gatekeeper quarantine, so
     # no Apple notarization, Developer account, or signing certificate is needed.
-    # The shared build.sh ad-hoc-signs it with a stable identifier so the TCC
-    # (mic / Accessibility) grants stick across upgrades. `squawk install-agent`
-    # discovers the result under libexec/squawk.
+    # The shared build.sh ad-hoc-signs it with a stable identifier
+    # (sh.squawk.ptt). Note the identifier is stable but the ad-hoc CDHash is
+    # not: it tracks the compiled bytes, so any source change — or switching
+    # between a plain-clang build and this Homebrew-superenv one — re-prompts
+    # for Microphone / Accessibility once. `squawk install-agent` discovers the
+    # result under libexec/squawk.
     helper = libexec/"squawk"
     helper.install "helper/squawkptt.m", "helper/Info.plist",
                    "helper/build.sh", "helper/sh.squawk.ptt.plist"
