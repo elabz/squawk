@@ -1,6 +1,24 @@
 # Changelog
 
-## Unreleased — Homebrew distribution, `install-agent` / `uninstall` / `doctor`
+## v0.1.1 — 2026-07-25
+
+- README: document `squawk doctor`, `squawk install-agent`, and
+  `squawk uninstall` in the Usage section. All three shipped in v0.1.0 but were
+  never listed there.
+- Correct the claim that the helper's stable ad-hoc signing identifier keeps TCC
+  grants across upgrades. macOS keys an ad-hoc app's grants to its **CDHash**,
+  which tracks the compiled bytes — and Homebrew's build differs from a plain
+  `clang` build of identical source, so moving between install methods
+  re-prompts for Microphone / Accessibility / Input Monitoring once. Routine
+  upgrades re-prompt only when the helper source actually changed.
+- Homebrew formula: fix the `depends_on` ordering flagged by
+  `brew audit --strict`.
+
+## v0.1.0 — 2026-07-25
+
+First public release. Everything below shipped in it.
+
+### Homebrew distribution, `install-agent` / `uninstall` / `doctor`
 
 - **One-command install** via a Homebrew tap: `brew install elabz/tap/squawk`.
   The formula compiles `SquawkPTT.app` **from source during install** — locally
@@ -22,7 +40,7 @@
   is factored into `helper/build.sh`, shared by the formula, the curl installer,
   `helper/install.sh`, and `squawk install-agent`.
 
-## Unreleased — native hold-detect (Karabiner removed)
+### native hold-detect (Karabiner removed)
 
 - **No more Karabiner-Elements.** SquawkPTT now detects tap-vs-hold on Space
   itself via a `CGEventTap`, replacing the Karabiner rule, the
@@ -49,7 +67,7 @@ then rebuild the helper with `helper/install.sh` and grant Accessibility + Input
 Monitoring to SquawkPTT when prompted. Karabiner-Elements can be uninstalled if
 it was installed only for squawk. Rollback = the steps `migrate` prints.
 
-## Unreleased — configurable backend, `squawk setup`
+### configurable backend, `squawk setup`
 
 - **Default backend**: OpenAI Whisper (`https://api.openai.com/v1`, `whisper-1`).
   With only an API key configured, squawk works with no further setup.
@@ -73,7 +91,7 @@ Migrating from the previous build: nothing is required. Your existing bare-key
 config file still works against the default OpenAI backend; run `squawk setup` to
 record a different URL/model in the new format.
 
-## Unreleased — rename to `squawk`
+### rename to `squawk`
 
 The project was renamed from its internal name to **squawk** and scrubbed of all
 private, environment-specific identifiers so it can be released as open source.

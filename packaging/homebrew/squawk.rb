@@ -3,7 +3,7 @@ class Squawk < Formula
   homepage "https://github.com/elabz/squawk"
   # Pin to a tagged release tarball. On each release, bump `url` + `sha256`
   # together — see packaging/homebrew/README.md for the procedure.
-  url "https://github.com/elabz/squawk/archive/refs/tags/v0.1.0.tar.gz"
+  url "https://github.com/elabz/squawk/archive/refs/tags/v0.1.1.tar.gz"
   sha256 "d0434a310beed636aaa304b7ee8b63b404edc66772cc9c527355f10d91534222"
   license "MIT"
 
