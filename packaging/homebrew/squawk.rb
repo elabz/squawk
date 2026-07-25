@@ -4,7 +4,7 @@ class Squawk < Formula
   # Pin to a tagged release tarball. On each release, bump `url` + `sha256`
   # together — see packaging/homebrew/README.md for the procedure.
   url "https://github.com/elabz/squawk/archive/refs/tags/v0.1.1.tar.gz"
-  sha256 "d0434a310beed636aaa304b7ee8b63b404edc66772cc9c527355f10d91534222"
+  sha256 "14b5dbe7daf8c156f754d2d4b41824ae9f61f4e07dd74e1fde43abd0e1d38081"
   license "MIT"
 
   # xcode (clang / Command Line Tools) compiles the helper during install.
