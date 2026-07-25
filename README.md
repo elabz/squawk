@@ -12,14 +12,16 @@ See [`docs/PRD.md`](docs/PRD.md) for the full design.
 
 ```bash
 brew install elabz/tap/squawk
-squawk install-agent   # build SquawkPTT.app + load the push-to-talk agent
+squawk install-agent   # install SquawkPTT.app + load the push-to-talk agent
 squawk setup           # choose your speech backend
 squawk doctor          # verify permissions + backend, with fixes for anything missing
 ```
 
-The formula compiles the helper **from source on your machine**, so there's no
-Gatekeeper block and no Apple notarization/Developer account involved. Grant the
-permissions `squawk doctor` lists, and hold Space in iTerm to talk.
+The formula compiles the helper **from source on your machine** during
+`brew install`, so there's no Gatekeeper block and no Apple
+notarization/Developer account involved — a locally built binary is never
+quarantined. Grant the permissions `squawk doctor` lists, and hold Space in
+iTerm to talk.
 
 No Homebrew? Use the installer script instead (read it first):
 
@@ -302,6 +304,15 @@ Accessibility / Input Monitoring grants accurately (a process can't query
 another app's TCC state directly), tests Automation by driving iTerm, and
 flags a lingering Karabiner rule.
 
+> **Expect one re-prompt when you switch install methods.** SquawkPTT is
+> ad-hoc-signed with a stable identifier (`sh.squawk.ptt`), but macOS keys an
+> ad-hoc app's privacy grants to its *CDHash*, which tracks the compiled bytes.
+> Homebrew builds with different compiler flags than a hand-run
+> `helper/install.sh`, so moving from one to the other produces a different
+> hash and macOS asks for Microphone / Accessibility / Input Monitoring again,
+> once. Routine `brew upgrade`s only re-prompt when the helper source actually
+> changed.
+
 Two hard-won TCC rules baked into the design:
 
 - A bare (non-bundle) binary can never be granted the microphone — requests from
@@ -361,7 +372,23 @@ message and remediation.
   recording — same `--keep-audio`/`--keep-newlines` flags as `dictate`. If that
   session has since closed, the worker copies the transcript to the clipboard
   instead of typing it somewhere unexpected.
-- `squawk check` — diagnostics, see above.
+- `squawk check` — backend diagnostics, see above.
+- `squawk doctor` — the full install health check, and the first thing to run
+  when anything misbehaves. Covers what `check` does plus `sox`, the Xcode
+  Command Line Tools, the LaunchAgent's state, SquawkPTT's Microphone /
+  Accessibility / Input Monitoring grants (read from its own log, since a
+  process can't query another app's TCC), Automation for iTerm, and any
+  leftover Karabiner rule. Every failing line prints the exact
+  `x-apple.systempreferences:` pane and a one-line remedy. Exits non-zero
+  unless every required item passes.
+- `squawk install-agent` — place `SquawkPTT.app` in `~/Applications`, install
+  and load its LaunchAgent, and confirm it is running. Uses the prebuilt app
+  when one shipped (Homebrew keg), otherwise compiles it from `helper/`. Safe
+  to re-run after an upgrade.
+- `squawk uninstall` — reverses `install-agent`: unloads the agent, removes
+  `SquawkPTT.app` and the LaunchAgent plist, and lists the privacy entries you
+  may want to revoke. Leaves the CLI and your config alone. Run this *before*
+  `brew uninstall` — Homebrew can't unload a launchd agent or clear TCC.
 - `squawk migrate` — one-time crossover from a legacy Karabiner-based install:
   removes the old hold-Space rule (backing up `karabiner.json`), unloads the
   legacy `org.elabz.voxptt` agent, and prints exact rollback steps. Safe to run
