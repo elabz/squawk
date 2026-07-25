@@ -48,6 +48,39 @@ extern char **environ;
 
 static char squawk_path[PATH_MAX];
 
+/* Locate the squawk CLI. `install-agent` writes the exact path of the CLI that
+ * ran it into the LaunchAgent's SQUAWK_CLI, which is authoritative — where the
+ * CLI lives depends entirely on how squawk was installed (Homebrew keg, ~/bin
+ * via the curl installer, or a repo checkout), and a launchd agent inherits no
+ * useful PATH to search. The fallbacks cover an agent installed before
+ * SQUAWK_CLI existed, or a hand-written plist. Returns NO if nothing usable was
+ * found, so startup can say so instead of failing silently on the first hold. */
+static BOOL resolve_squawk_path(const char *home) {
+    const char *explicit_path = getenv("SQUAWK_CLI");
+    if (explicit_path && *explicit_path && access(explicit_path, X_OK) == 0) {
+        snprintf(squawk_path, sizeof squawk_path, "%s", explicit_path);
+        return YES;
+    }
+    if (explicit_path && *explicit_path)
+        fprintf(stderr, "squawkptt: SQUAWK_CLI=%s is not executable — falling back\n",
+                explicit_path);
+
+    const char *fallbacks[] = {"/opt/homebrew/bin/squawk", "/usr/local/bin/squawk"};
+    char candidate[PATH_MAX];
+    snprintf(candidate, sizeof candidate, "%s/bin/squawk", home);
+    if (access(candidate, X_OK) == 0) {
+        snprintf(squawk_path, sizeof squawk_path, "%s", candidate);
+        return YES;
+    }
+    for (size_t i = 0; i < sizeof fallbacks / sizeof *fallbacks; i++) {
+        if (access(fallbacks[i], X_OK) == 0) {
+            snprintf(squawk_path, sizeof squawk_path, "%s", fallbacks[i]);
+            return YES;
+        }
+    }
+    return NO;
+}
+
 static double g_hold_ms = DEFAULT_HOLD_MS;
 static CFMachPortRef g_tap = NULL;
 
@@ -71,6 +104,12 @@ static BOOL g_conflict = NO;
  * Timeout. squawk itself detaches sox and the transcription worker. SIGCHLD is
  * SIG_IGN (set in main), so the kernel reaps these with no zombies. */
 static void run_squawk(const char *subcommand) {
+    if (!squawk_path[0]) {
+        fprintf(stderr, "squawkptt: cannot run `squawk %s` — no CLI was found at "
+                        "startup. Run `squawk install-agent` to record its path.\n",
+                subcommand);
+        return;
+    }
     char *argv[] = {squawk_path, (char *)subcommand, NULL};
     pid_t pid;
     if (posix_spawn(&pid, squawk_path, NULL, NULL, argv, environ) != 0)
@@ -264,7 +303,14 @@ int main(void) {
         fprintf(stderr, "squawkptt: HOME not set\n");
         return 1;
     }
-    snprintf(squawk_path, sizeof squawk_path, "%s/bin/squawk", home);
+    if (resolve_squawk_path(home))
+        fprintf(stderr, "squawkptt: squawk CLI at %s\n", squawk_path);
+    else
+        fprintf(stderr, "squawkptt: NO squawk CLI FOUND — checked $SQUAWK_CLI, "
+                        "%s/bin/squawk, /opt/homebrew/bin/squawk, "
+                        "/usr/local/bin/squawk. Push-to-talk will do nothing. "
+                        "Re-run `squawk install-agent` to record the right path.\n",
+                home);
 
     /* Non-blocking child spawns with no zombies: let the kernel reap them. */
     signal(SIGCHLD, SIG_IGN);

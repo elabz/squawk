@@ -12,5 +12,14 @@
 	<true/>
 	<key>StandardErrorPath</key>
 	<string>__HOME__/Library/Logs/squawkptt.log</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<!-- Absolute path of the squawk CLI that ran `install-agent`. The helper
+		     spawns this for ptt-start/ptt-stop. Set explicitly because the CLI's
+		     location depends on how squawk was installed (Homebrew keg, ~/bin,
+		     or a repo checkout) and launchd agents get no useful PATH. -->
+		<key>SQUAWK_CLI</key>
+		<string>__SQUAWK_CLI__</string>
+	</dict>
 </dict>
 </plist>

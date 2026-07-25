@@ -1022,6 +1022,36 @@ def agent_running():
     return "state = running" in r.stdout or "pid = " in r.stdout
 
 
+def helper_cli_path():
+    """The squawk CLI the helper will spawn, and where that answer came from.
+
+    Mirrors resolve_squawk_path() in squawkptt.m: the SQUAWK_CLI recorded in the
+    installed LaunchAgent wins, then ~/bin/squawk, then the Homebrew prefixes.
+    Returns (path, source) or (None, None). The path is returned even when it is
+    missing or non-executable so the caller can say which path is broken."""
+    try:
+        with open(AGENT_PLIST_DST) as f:
+            plist = f.read()
+    except OSError:
+        plist = ""
+    # Minimal, dependency-free read of <key>SQUAWK_CLI</key><string>…</string>.
+    marker = "<key>SQUAWK_CLI</key>"
+    idx = plist.find(marker)
+    if idx != -1:
+        start = plist.find("<string>", idx)
+        end = plist.find("</string>", start) if start != -1 else -1
+        if start != -1 and end != -1:
+            recorded = plist[start + len("<string>"):end].strip()
+            if recorded and recorded != "__SQUAWK_CLI__":
+                return recorded, "recorded in the LaunchAgent"
+
+    for candidate in (os.path.expanduser("~/bin/squawk"),
+                      "/opt/homebrew/bin/squawk", "/usr/local/bin/squawk"):
+        if os.access(candidate, os.X_OK):
+            return candidate, "fallback — re-run install-agent to record it"
+    return None, None
+
+
 def cmd_install_agent():
     """Place SquawkPTT.app in ~/Applications, install and load its LaunchAgent,
     and confirm it is running. The Homebrew formula delegates this stateful,
@@ -1058,8 +1088,19 @@ def cmd_install_agent():
         return 1
     # The plist ships with __HOME__ placeholders (launchd can't expand ~/$HOME);
     # substitute the real home so Program and the log path are absolute.
+    # __SQUAWK_CLI__ becomes the absolute path of the CLI running right now, which
+    # the helper spawns for ptt-start/ptt-stop. It must be recorded rather than
+    # assumed: a Homebrew install leaves the CLI in the keg (linked into
+    # /opt/homebrew/bin) and never creates ~/bin/squawk, so the helper's old
+    # hardcoded ~/bin/squawk path did not exist at all on a brew-only machine.
+    # abspath, deliberately NOT realpath: under Homebrew the CLI is reached via
+    # the stable symlink /opt/homebrew/bin/squawk, and resolving it would pin the
+    # plist to a versioned keg path that the next `brew upgrade` deletes.
+    cli_path = os.path.abspath(__file__)
     with open(plist_src) as f:
-        plist = f.read().replace("__HOME__", os.path.expanduser("~"))
+        plist = (f.read()
+                 .replace("__HOME__", os.path.expanduser("~"))
+                 .replace("__SQUAWK_CLI__", cli_path))
     os.makedirs(os.path.dirname(AGENT_PLIST_DST), exist_ok=True)
     with open(AGENT_PLIST_DST, "w") as f:
         f.write(plist)
@@ -1072,6 +1113,7 @@ def cmd_install_agent():
 
     if agent_running():
         print(f"SquawkPTT agent loaded and running (label {AGENT_LABEL}).")
+        print(f"Push-to-talk will run: {cli_path}")
         print("Next: grant permissions when prompted, then run `squawk doctor`.")
         return 0
     print("squawk: agent installed but not confirmed running — run `squawk doctor` "
@@ -1216,6 +1258,23 @@ def cmd_doctor(cfg):
         report("OK", "LaunchAgent", f"{AGENT_LABEL} loaded and running")
     else:
         report("FAIL", "LaunchAgent", f"{AGENT_LABEL} not running — run: squawk install-agent")
+
+    # The CLI the helper actually spawns. Everything else can be green while this
+    # is broken — the agent runs, permissions are granted, the backend answers —
+    # and holding Space still does nothing, because the helper cannot find the
+    # binary to run. Check the recorded path, not merely that some squawk exists.
+    cli, cli_src = helper_cli_path()
+    if cli is None:
+        report("FAIL", "CLI reachable by helper",
+               "the LaunchAgent records no SQUAWK_CLI and no squawk was found in "
+               "~/bin, /opt/homebrew/bin, or /usr/local/bin — push-to-talk cannot "
+               "start. Fix: squawk install-agent")
+    elif not os.access(cli, os.X_OK):
+        report("FAIL", "CLI reachable by helper",
+               f"{cli} ({cli_src}) is missing or not executable — push-to-talk "
+               f"cannot start. Fix: squawk install-agent")
+    else:
+        report("OK", "CLI reachable by helper", f"{cli} ({cli_src})")
 
     # SquawkPTT's own per-app grants, read from its launch log.
     st = read_helper_log_status()
