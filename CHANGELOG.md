@@ -1,5 +1,23 @@
 # Changelog
 
+## v0.1.2 — 2026-07-25
+
+**Fixes push-to-talk being completely dead on a Homebrew install.** If you
+installed with `brew install elabz/tap/squawk`, upgrade and re-run
+`squawk install-agent`.
+
+- The helper hardcoded `$HOME/bin/squawk`, which a Homebrew install never
+  creates — the CLI lives in the keg, linked as `/opt/homebrew/bin/squawk`. The
+  agent loaded, permissions granted, and `squawk doctor` went green, but holding
+  Space did nothing: the hold was swallowed and the spawn failed with `ENOENT`.
+- `squawk install-agent` now records the absolute path of the CLI that ran it
+  into the LaunchAgent as `SQUAWK_CLI`, and prints it on success.
+- The helper resolves the CLI (`SQUAWK_CLI` → `~/bin` → `/opt/homebrew/bin` →
+  `/usr/local/bin`), logs which one it chose, and says so plainly when none is
+  usable instead of failing silently on every hold.
+- **`squawk doctor` gained a "CLI reachable by helper" check** — its absence is
+  why this shipped, since every other check passes while push-to-talk is broken.
+
 ## v0.1.1 — 2026-07-25
 
 - README: document `squawk doctor`, `squawk install-agent`, and
