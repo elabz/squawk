@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+
+# Compiled helper / built app bundle
+helper/squawkptt
+helper/SquawkPTT.app/
+*.app
+
+# OS noise
+.DS_Store
+
+# Editor
+.idea/
+.vscode/
