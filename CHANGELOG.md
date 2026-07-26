@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.1.3 — 2026-07-25
 
 **Visual mode indicator.** Until now the only feedback was sounds, which left
 two moments invisible: whether the mic actually went live, and whether a
@@ -25,7 +25,10 @@ for each state — 🎤 recording, 💭 transcribing, then a brief ✅ / 🔇 / 
   recorder is already capturing, then cached in the lock file, so the release →
   💭 transition and every terminal state are free writes.
 - **The SquawkPTT helper is unchanged**, so this upgrade does not re-prompt for
-  Microphone / Accessibility / Input Monitoring.
+  Microphone / Accessibility / Input Monitoring. `helper/squawkptt.m` is
+  byte-identical to v0.1.2, so a `brew upgrade` rebuild under the same Homebrew
+  toolchain produces the same ad-hoc CDHash and your grants carry over. There is
+  no need to re-run `squawk install-agent` for this release.
 
 ## v0.1.2 — 2026-07-25
 
