@@ -92,6 +92,9 @@ file:
 | `SQUAWK_SILENCE_STOP` | `1.5` | Seconds of trailing silence that stops recording |
 | `SQUAWK_MAX_SECONDS` | `60` | Hard cap on recording duration |
 | `SQUAWK_INPUT_DEVICE` | `default` | Passed as `AUDIODEV` to sox when not `default` |
+| `SQUAWK_INDICATOR` | `both` | Visual mode indicator: `both`, `badge`, `cursor`, or `off` |
+| `SQUAWK_INDICATOR_GLYPH_<STATE>` | see below | Override the glyph for one state |
+| `SQUAWK_INDICATOR_COLOR_<STATE>` | see below | Override the cursor colour for one state |
 
 The file is plain `KEY=value`, one per line (`#` comments allowed), so you can
 hand-edit it instead of re-running `setup`:
@@ -105,6 +108,93 @@ SQUAWK_SILENCE_STOP=1.2
 
 It holds your API key, so keep it at mode 600 — squawk warns on stderr if it
 finds anything looser.
+
+## Mode indicator
+
+squawk signals what it is doing two ways: distinct sounds, and a glyph in the
+iTerm session. The visual channel exists because two moments are otherwise
+invisible — whether the mic actually went live (a hold shorter than the
+threshold types a space instead), and whether a transcription is still in
+flight during the second or two before the text lands.
+
+| State | Glyph | Cursor | When |
+|---|---|---|---|
+| recording | 🎤 | red | mic is live, still holding the key |
+| transcribing | 💭 | amber | key released, waiting on the endpoint |
+| delivered | ✅ | — | transcript landed (flashes, then clears) |
+| heard nothing | 🔇 | — | empty transcript (flashes, then clears) |
+| error | ❗ | — | capture, transcription, or delivery failed |
+
+The glyph is drawn as the **iTerm session badge**, in the top-right of the
+session. That is session chrome rather than terminal content, so a full-screen
+TUI (vim, htop, an agent composer) cannot overwrite it and neither can your
+shell prompt. Note that iTerm draws the badge desaturated — the glyphs are
+distinguishable by shape, not colour.
+
+Set `SQUAWK_INDICATOR` to pick surfaces:
+
+```
+SQUAWK_INDICATOR=both      # badge + status-bar variable + cursor colour (default)
+SQUAWK_INDICATOR=badge     # badge + status-bar variable, no cursor colour
+SQUAWK_INDICATOR=cursor    # cursor colour only — no glyph on any surface
+SQUAWK_INDICATOR=off       # audio only, exactly as before this feature existed
+```
+
+The status-bar variable rides along with the badge, so the status bar below works
+under `both` or `badge` — but not under `cursor`, which paints no glyph anywhere.
+
+Override individual glyphs or colours per state — the state name is the one from
+the table above, uppercased:
+
+```
+SQUAWK_INDICATOR_GLYPH_RECORDING=🔴
+SQUAWK_INDICATOR_GLYPH_TRANSCRIBING=⏳
+SQUAWK_INDICATOR_COLOR_RECORDING=#FF0000
+```
+
+**If your prompt manages the cursor colour** (zsh vi-mode, starship, and
+similar set it per mode), it will fight `SQUAWK_INDICATOR=cursor` and win on the
+next redraw. Use `SQUAWK_INDICATOR=badge` in that case — the badge is
+unaffected.
+
+**Want the glyph nearer where you type?** squawk also publishes the state as the
+iTerm user variable `squawk`, which you can show in the session's status bar.
+Nothing else ever writes to that variable, so no prompt or program can clobber
+it. One-time setup (labels verified against iTerm 3.6.11):
+
+1. `⌘,` to open Settings, then type `status bar` into the search field at the
+   top — it highlights the relevant settings wherever they live. (Direct path:
+   **Profiles → Session**.)
+2. Tick **Status bar enabled**.
+3. Click **Configure Status Bar**.
+4. Drag **Interpolated String** into the status bar layout, then set its value to
+   exactly `\(user.squawk)`. Put it at the left end to sit nearest your prompt.
+5. Set **Status bar location:** to **Bottom** — it defaults to the *top* of the
+   session ("Shows a configurable status bar at the top of each session"), which
+   is further from where you type than the corner badge.
+6. Run `squawk reset-indicator` once. This defines the `squawk` variable as empty
+   so the component renders blank instead of an unset-variable placeholder until
+   your first dictation.
+
+The status bar is per-session, so the glyph appears in the session you dictated
+into. A newly created session shows nothing until squawk next writes to it.
+
+Note this is *not* the same thing as putting an emoji at the text cursor — that
+is not possible. iTerm draws the cursor as a coloured block/bar/underline with no
+glyph substitution, and writing a glyph into the cell beside the cursor works
+only at a bare shell prompt: any full-screen TUI (vim, or an agent composer like
+Claude Code) repaints that cell continuously and erases it. Cursor colour
+survives there precisely because iTerm draws it, not the application.
+
+If a glyph or cursor colour ever gets stranded — a process killed mid-dictation,
+say — clear it with:
+
+```bash
+squawk reset-indicator
+```
+
+One quirk worth knowing: macOS notification banners appear in the same top-right
+corner as the badge and will cover it while they are on screen.
 
 ## Backends
 
@@ -393,12 +483,18 @@ message and remediation.
   removes the old hold-Space rule (backing up `karabiner.json`), unloads the
   legacy `org.elabz.voxptt` agent, and prints exact rollback steps. Safe to run
   when there's nothing to migrate (it says so and changes nothing).
+- `squawk reset-indicator` — clear a stuck [mode indicator](#mode-indicator)
+  (badge and cursor colour). Only needed if a dictation was killed before it
+  could clean up after itself.
 
-Audible feedback (since a full-screen TUI owns the display): a start chime when
-recording begins, a success chime when text is emitted, a distinct "heard
-nothing" chime for an empty transcript, and an error chime on any failure. Every
-failure mode degrades to "nothing injected" — squawk never types partial or error
-text into your session.
+Feedback comes on two channels. **Audible**: a start chime when recording
+begins, an acknowledgement the instant you release, a success chime when text is
+emitted, a distinct "heard nothing" chime for an empty transcript, and an error
+chime on any failure. **Visual**: a glyph in the session showing the current
+mode — see [Mode indicator](#mode-indicator). The audible channel is complete on
+its own, so `SQUAWK_INDICATOR=off` loses no information. Every failure mode
+degrades to "nothing injected" — squawk never types partial or error text into
+your session.
 
 ## Troubleshooting
 

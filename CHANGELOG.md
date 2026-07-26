@@ -1,5 +1,32 @@
 # Changelog
 
+## Unreleased
+
+**Visual mode indicator.** Until now the only feedback was sounds, which left
+two moments invisible: whether the mic actually went live, and whether a
+transcription was still in flight. squawk now shows a glyph in the iTerm session
+for each state — 🎤 recording, 💭 transcribing, then a brief ✅ / 🔇 / ❗.
+
+- Rendered as the iTerm **session badge**, plus the text-cursor colour (red while
+  recording, amber while transcribing). The badge is session chrome rather than
+  terminal content, so a full-screen TUI and your shell prompt both leave it
+  alone. iTerm draws it desaturated, so the states are distinguished by shape.
+- `SQUAWK_INDICATOR=both|badge|cursor|off` (default `both`); per-state glyph and
+  colour overrides via `SQUAWK_INDICATOR_GLYPH_<STATE>` /
+  `SQUAWK_INDICATOR_COLOR_<STATE>`. `off` reproduces the previous behaviour
+  exactly. Use `badge` if your prompt manages the cursor colour itself (zsh
+  vi-mode, starship), since it will otherwise win on the next redraw.
+- The state is also published as the iTerm user variable `squawk`, bindable in a
+  status-bar component if you want the glyph nearer where you type than the
+  session corner. See the README.
+- **New `squawk reset-indicator`** to clear a stranded glyph or cursor colour if a
+  dictation is killed before it can clean up; `squawk doctor` points at it.
+- Recording latency is untouched: the session tty is resolved *after* the
+  recorder is already capturing, then cached in the lock file, so the release →
+  💭 transition and every terminal state are free writes.
+- **The SquawkPTT helper is unchanged**, so this upgrade does not re-prompt for
+  Microphone / Accessibility / Input Monitoring.
+
 ## v0.1.2 — 2026-07-25
 
 **Fixes push-to-talk being completely dead on a Homebrew install.** If you

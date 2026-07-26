@@ -3,6 +3,7 @@
 OpenAI-compatible speech endpoint, and print the transcript to stdout."""
 
 import argparse
+import base64
 import getpass
 import http.client
 import json
@@ -46,6 +47,35 @@ SOUND_SUCCESS = "/System/Library/Sounds/Glass.aiff"
 SOUND_EMPTY = "/System/Library/Sounds/Tink.aiff"
 SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
 
+# Visual mode indicator: the same states the sounds above signal, rendered as a
+# glyph in the iTerm session so "mic is hot" and "still thinking" are visible and
+# not just audible. Each state maps to (glyph, cursor colour); a None colour
+# leaves the cursor at the profile default.
+#
+# iTerm draws the badge DESATURATED — it applies the badge colour and alpha to
+# the glyph, so emoji lose their hue. States must therefore be distinguishable by
+# SHAPE; colour carries no information and is only an accent on the text cursor.
+INDICATOR_GLYPHS = {
+    "recording": "🎤",
+    "transcribing": "💭",
+    "success": "✅",
+    "empty": "🔇",
+    "error": "❗",
+}
+INDICATOR_COLORS = {
+    "recording": "#FF3B30",     # red — mic is live
+    "transcribing": "#FF9F0A",  # amber — waiting on the transcription
+}
+INDICATOR_STATES = tuple(INDICATOR_GLYPHS)
+# Terminal states linger just long enough to be noticed, then clear. Only the
+# detached worker shows these, and it has already delivered the transcript by
+# then, so the wait costs nothing the user is waiting on.
+INDICATOR_FLASH_SECONDS = 1.0
+# Surfaces: "badge" is the session badge, "cursor" the text-cursor colour,
+# "both" is the default, "off" disables the visual channel entirely.
+INDICATOR_MODES = ("both", "badge", "cursor", "off")
+DEFAULT_INDICATOR = "both"
+
 LOCK_PATH = os.path.join(tempfile.gettempdir(), "squawk.lock")
 WORKER_LOG = os.path.join(tempfile.gettempdir(), "squawk-worker.log")
 SOX_LOG = os.path.join(tempfile.gettempdir(), "squawk-sox.log")
@@ -76,10 +106,28 @@ class Config:
     silence_stop: float
     max_seconds: float
     input_device: str
+    indicator: str
+    indicator_glyphs: dict
+    indicator_colors: dict
 
 
 CONFIG_DIR = os.path.expanduser("~/.config/squawk")
 CONFIG_PATH = os.path.join(CONFIG_DIR, "config")
+
+
+def _glyph_key(state):
+    return f"SQUAWK_INDICATOR_GLYPH_{state.upper()}"
+
+
+def _color_key(state):
+    return f"SQUAWK_INDICATOR_COLOR_{state.upper()}"
+
+
+# Per-state glyph and cursor-colour overrides are generated rather than spelled
+# out, so adding a state to INDICATOR_GLYPHS makes it configurable for free.
+INDICATOR_SETTING_KEYS = tuple(
+    [_glyph_key(s) for s in INDICATOR_STATES] + [_color_key(s) for s in INDICATOR_STATES]
+)
 
 SETTING_KEYS = (
     "SQUAWK_SPEECH_URL",
@@ -88,7 +136,8 @@ SETTING_KEYS = (
     "SQUAWK_SILENCE_STOP",
     "SQUAWK_MAX_SECONDS",
     "SQUAWK_INPUT_DEVICE",
-)
+    "SQUAWK_INDICATOR",
+) + INDICATOR_SETTING_KEYS
 
 DEFAULTS = {
     "SQUAWK_SPEECH_URL": DEFAULT_SPEECH_URL,
@@ -97,7 +146,10 @@ DEFAULTS = {
     "SQUAWK_SILENCE_STOP": DEFAULT_SILENCE_STOP,
     "SQUAWK_MAX_SECONDS": DEFAULT_MAX_SECONDS,
     "SQUAWK_INPUT_DEVICE": DEFAULT_INPUT_DEVICE,
+    "SQUAWK_INDICATOR": DEFAULT_INDICATOR,
 }
+DEFAULTS.update({_glyph_key(s): g for s, g in INDICATOR_GLYPHS.items()})
+DEFAULTS.update({_color_key(s): INDICATOR_COLORS.get(s, "") for s in INDICATOR_STATES})
 
 
 def unquote(value):
@@ -183,6 +235,12 @@ def load_config(path=CONFIG_PATH):
                   f"using {DEFAULTS[key]}", file=sys.stderr)
             return float(DEFAULTS[key])
 
+    indicator = values["SQUAWK_INDICATOR"].strip().lower()
+    if indicator not in INDICATOR_MODES:
+        print(f"squawk: warning: SQUAWK_INDICATOR={values['SQUAWK_INDICATOR']!r} is not one of "
+              f"{', '.join(INDICATOR_MODES)}; using {DEFAULT_INDICATOR}", file=sys.stderr)
+        indicator = DEFAULT_INDICATOR
+
     return Config(
         speech_url=values["SQUAWK_SPEECH_URL"].rstrip("/"),
         speech_key=values["SQUAWK_SPEECH_KEY"].strip(),
@@ -190,6 +248,9 @@ def load_config(path=CONFIG_PATH):
         silence_stop=as_float("SQUAWK_SILENCE_STOP"),
         max_seconds=as_float("SQUAWK_MAX_SECONDS"),
         input_device=values["SQUAWK_INPUT_DEVICE"],
+        indicator=indicator,
+        indicator_glyphs={s: values[_glyph_key(s)] for s in INDICATOR_STATES},
+        indicator_colors={s: values[_color_key(s)].strip() for s in INDICATOR_STATES},
     )
 
 
@@ -207,6 +268,147 @@ def play_sound(path):
         pass
 
 
+# ── Visual mode indicator ────────────────────────────────────────────────────
+# The indicator is painted by writing terminal escape sequences straight to the
+# iTerm session's tty device. This is deliberately NOT the inject_into_iterm()
+# path: that uses the scripting `write text` verb, which delivers characters to
+# the session as though typed — the shell would swallow them. Escape sequences
+# have to reach iTerm's own parser, and writing to the tty is how that happens.
+#
+# Every operation here is best-effort and silent on failure, exactly like
+# play_sound(). The indicator is a convenience layer over a working pipeline and
+# must never be able to break dictation.
+
+
+def _osc(payload):
+    """An OSC escape sequence, BEL-terminated (what iTerm expects)."""
+    return f"\033]{payload}\007"
+
+
+def _b64(text):
+    return base64.b64encode((text or "").encode("utf-8")).decode("ascii")
+
+
+def _write_tty(tty, data):
+    """Write to a tty device without ever blocking or raising.
+
+    O_NONBLOCK matters: the target tty belongs to another process, and squawk
+    writes to it from the keystroke-hot path. A full or wedged terminal must
+    cost us nothing, so a short write or EAGAIN is simply dropped.
+    """
+    # The /dev/ guard matters because one tty value round-trips through the lock
+    # file: even if that were ever tampered with, this can only ever write to a
+    # device node, never to an arbitrary file.
+    if not tty or not data or not tty.startswith("/dev/"):
+        return
+    try:
+        fd = os.open(tty, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        return  # vanished, not a tty, or not ours to write
+    try:
+        os.write(fd, data.encode("utf-8"))
+    except OSError:
+        pass
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
+def current_tty():
+    """The tty this process is already attached to, if any.
+
+    Free — no subprocess. Available when squawk runs inside a session (`dictate`
+    from a shell or an iTerm coprocess). stderr is checked before stdout because
+    `dictate` writes the transcript to stdout, which is routinely a pipe.
+    """
+    for stream in (sys.stderr, sys.stdout, sys.stdin):
+        try:
+            return os.ttyname(stream.fileno())
+        except (OSError, ValueError, AttributeError):
+            continue
+    return None
+
+
+def resolve_session_tty():
+    """The tty of the iTerm session to paint into, or None.
+
+    Prefers this process's own tty, which costs nothing. Under push-to-talk the
+    helper spawns squawk with no terminal at all, so it falls back to asking
+    iTerm for the frontmost session — correct, because the trigger only fires
+    while iTerm is frontmost. That ~200 ms round-trip is why the result is cached
+    in the lock file and resolved at most once per dictation.
+    """
+    tty = current_tty()
+    if tty and os.access(tty, os.W_OK):
+        return tty
+    try:
+        result = subprocess.run(
+            ["osascript", "-e",
+             'tell application "iTerm2" to get tty of current session of current window'],
+            capture_output=True, text=True, timeout=5,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    tty = result.stdout.strip()
+    if tty.startswith("/dev/") and os.access(tty, os.W_OK):
+        return tty
+    return None
+
+
+def indicator_sequences(cfg, state):
+    """The escape sequences that paint `state`, honouring the configured surfaces.
+    A state of None means "clear". Returns "" when nothing should be written."""
+    if cfg.indicator == "off":
+        return ""
+    parts = []
+    glyph = cfg.indicator_glyphs.get(state, "") if state else ""
+    if cfg.indicator in ("both", "badge"):
+        # The badge is session chrome, not grid content, so a full-screen TUI and
+        # a shell prompt both leave it alone. The user var is invisible unless the
+        # user binds it in an iTerm status-bar component — one extra free write
+        # that makes that opt-in surface work.
+        parts.append(_osc("1337;SetBadgeFormat=" + _b64(glyph)))
+        parts.append(_osc("1337;SetUserVar=squawk=" + _b64(glyph)))
+    if cfg.indicator in ("both", "cursor"):
+        color = cfg.indicator_colors.get(state, "") if state else ""
+        # OSC 112 restores the profile's own cursor colour, which is more robust
+        # than trying to remember and put back whatever was there before.
+        parts.append(_osc(f"12;{color}") if color else _osc("112"))
+    return "".join(parts)
+
+
+def set_indicator(cfg, state, tty):
+    """Paint `state` into the given session. Silent no-op without a usable tty."""
+    _write_tty(tty, indicator_sequences(cfg, state))
+
+
+def clear_indicator(cfg, tty, force=False):
+    """Remove indicator state from the given session.
+
+    Teardown clears *every* surface rather than only the configured ones, so a
+    changed config or residue from a crashed run can never strand a glyph or a
+    recoloured cursor. `force` clears even when the indicator is disabled, which
+    is what `squawk reset-indicator` needs.
+    """
+    if cfg.indicator == "off" and not force:
+        return
+    _write_tty(tty, _osc("1337;SetBadgeFormat=") + _osc("1337;SetUserVar=squawk=")
+               + _osc("112"))
+
+
+def flash_indicator(cfg, state, tty):
+    """Show a terminal state briefly, then clear. Only ever called from the
+    detached worker, which has already delivered the transcript — so this wait is
+    not on any path the user is waiting on."""
+    if not tty or cfg.indicator == "off":
+        return
+    set_indicator(cfg, state, tty)
+    time.sleep(INDICATOR_FLASH_SECONDS)
+    clear_indicator(cfg, tty)
+
+
 def pid_alive(pid):
     try:
         os.kill(pid, 0)
@@ -221,13 +423,15 @@ def read_lock():
     try:
         with open(LOCK_PATH) as f:
             data = json.load(f)
-        return data.get("pid"), data.get("wav"), data.get("session")
+        # `tty` is read with .get() like the rest: a lock written by an older
+        # squawk simply yields None and the visual indicator is skipped.
+        return data.get("pid"), data.get("wav"), data.get("session"), data.get("tty")
     except (OSError, ValueError):
-        return None, None, None
+        return None, None, None, None
 
 
 def acquire_lock(pid):
-    existing_pid, _, _ = read_lock()
+    existing_pid, _, _, _ = read_lock()
     if existing_pid and pid_alive(existing_pid):
         return False
     try:
@@ -243,9 +447,9 @@ def acquire_lock(pid):
     return True
 
 
-def write_lock_wav(pid, wav_path, session=None):
+def write_lock_wav(pid, wav_path, session=None, tty=None):
     with open(LOCK_PATH, "w") as f:
-        json.dump({"pid": pid, "wav": wav_path, "session": session}, f)
+        json.dump({"pid": pid, "wav": wav_path, "session": session, "tty": tty}, f)
 
 
 def release_lock():
@@ -461,11 +665,11 @@ def copy_to_clipboard(text):
         return False
 
 
-def spawn_finish(pid, wav_path, session, keep_audio, keep_newlines):
+def spawn_finish(pid, wav_path, session, tty, keep_audio, keep_newlines):
     """Launch the transcription+delivery worker fully detached from this
     short-lived keystroke hook, which must return immediately."""
     args = [sys.executable, os.path.realpath(__file__), "_finish", wav_path or "",
-            "--session", session or "", "--pid", str(pid or 0)]
+            "--session", session or "", "--pid", str(pid or 0), "--tty", tty or ""]
     if keep_audio:
         args.append("--keep-audio")
     if keep_newlines:
@@ -481,29 +685,36 @@ def spawn_finish(pid, wav_path, session, keep_audio, keep_newlines):
     except OSError as exc:
         log(f"failed to start transcription worker: {exc}")
         play_sound(SOUND_ERROR)
+        return False
+    return True
 
 
-def transcribe_and_emit(wav_path, cfg, keep_newlines):
+def transcribe_and_emit(wav_path, cfg, keep_newlines, tty=None):
     if not wav_path or not os.path.exists(wav_path) or os.path.getsize(wav_path) <= WAV_HEADER_BYTES:
         log("microphone capture failed (no audio captured)")
         play_sound(SOUND_ERROR)
+        flash_indicator(cfg, "error", tty)
         return 1
 
+    set_indicator(cfg, "transcribing", tty)
     try:
         text = transcribe(wav_path, cfg)
     except Exception as exc:
         log(f"transcription failed: {describe_speech_failure(cfg, exc)}")
         play_sound(SOUND_ERROR)
+        flash_indicator(cfg, "error", tty)
         return 1
 
     text = sanitize(text, keep_newlines)
     if not text:
         play_sound(SOUND_EMPTY)
+        flash_indicator(cfg, "empty", tty)
         return 0
 
     sys.stdout.write(text)
     sys.stdout.flush()
     play_sound(SOUND_SUCCESS)
+    flash_indicator(cfg, "success", tty)
     return 0
 
 
@@ -514,20 +725,27 @@ def cmd_dictate(cfg, keep_audio=False, keep_newlines=False):
         return 1
 
     wav_path = None
+    # `dictate` runs inside a session, so its own tty is the target — no
+    # osascript round-trip needed here, unlike the push-to-talk path.
+    tty = current_tty()
     try:
         play_sound(SOUND_START)
+        clear_indicator(cfg, tty)
+        set_indicator(cfg, "recording", tty)
         fd, wav_path = tempfile.mkstemp(suffix=".wav", dir=tempfile.gettempdir(), prefix="squawk-")
         os.close(fd)
-        write_lock_wav(os.getpid(), wav_path)
+        write_lock_wav(os.getpid(), wav_path, tty=tty)
 
         captured = capture_audio(wav_path, cfg)
         if not captured:
             log("microphone capture failed (no audio captured)")
             play_sound(SOUND_ERROR)
+            flash_indicator(cfg, "error", tty)
             return 1
 
-        return transcribe_and_emit(wav_path, cfg, keep_newlines)
+        return transcribe_and_emit(wav_path, cfg, keep_newlines, tty)
     finally:
+        clear_indicator(cfg, tty)
         if wav_path and os.path.exists(wav_path):
             if keep_audio:
                 log(f"kept audio at {wav_path}")
@@ -586,20 +804,32 @@ def cmd_ptt_start(cfg):
     # session, which is correct because the trigger only fires while iTerm is
     # the frontmost application.
     session = os.environ.get("ITERM_SESSION_ID", "").split(":", 1)[-1]
-    write_lock_wav(proc.pid, raw_path, session)
     log(f"ptt-start: recording (sox pid={proc.pid}) -> {raw_path}")
     play_sound(SOUND_START)
+
+    # Only now resolve the session tty. Under push-to-talk this costs an
+    # osascript round-trip (~200 ms), so it deliberately happens AFTER sox is
+    # already capturing and after the start cue has fired — the audible ack stays
+    # instant and recording latency is untouched. Cached in the lock file so
+    # ptt-stop and the worker paint for free.
+    tty = resolve_session_tty()
+    write_lock_wav(proc.pid, raw_path, session, tty)
+    # Clear before painting: residue from a run that was killed before it could
+    # clean up must not survive into this one.
+    clear_indicator(cfg, tty)
+    set_indicator(cfg, "recording", tty)
     return 0
 
 
-def cmd_ptt_stop(keep_audio=False, keep_newlines=False):
+def cmd_ptt_stop(cfg, keep_audio=False, keep_newlines=False):
     # Called by SquawkPTT on Space release. The helper only fires this when a
     # hold actually started recording, but stay defensive — do the bare minimum
     # (acknowledge the release, kill the recorder, hand the rest to a detached
     # worker), then return at once. If nothing was recording, silently no-op.
-    pid, raw_path, session = read_lock()
+    pid, raw_path, session, tty = read_lock()
     if not pid or not pid_alive(pid):
-        # Nothing was recording (e.g. a plain space tap) — silent no-op.
+        # Nothing was recording (e.g. a plain space tap) — silent no-op, and
+        # nothing was painted either, so there is nothing to clear.
         release_lock()
         return 0
 
@@ -609,23 +839,53 @@ def cmd_ptt_stop(keep_audio=False, keep_newlines=False):
     # WAV header to finalize), so the bytes already on disk are complete audio.
     log(f"ptt-stop: release -> SIGKILL sox pid={pid}")
     play_sound(SOUND_ACK)  # immediate "released, on it" cue
+    # The tty was resolved at ptt-start, so this is a single free write — the
+    # "thinking" glyph appears the moment Space comes up, which is the whole
+    # point of the feature: the 1-3 s transcription gap becomes visible.
+    set_indicator(cfg, "transcribing", tty)
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     release_lock()
 
-    spawn_finish(pid, raw_path, session, keep_audio, keep_newlines)
+    if not spawn_finish(pid, raw_path, session, tty, keep_audio, keep_newlines):
+        # The worker never started, so nothing downstream will ever clear the
+        # "thinking" glyph. Show the failure and clean up here instead of
+        # stranding it on screen. Safe to block briefly: the helper spawned this
+        # process fire-and-forget and is not waiting on it.
+        flash_indicator(cfg, "error", tty)
+        return 1
     return 0
 
 
-def cmd_finish(cfg, raw_path, session, pid=0, keep_audio=False, keep_newlines=False):
+def cmd_finish(cfg, raw_path, session, pid=0, tty=None, keep_audio=False, keep_newlines=False):
     """Detached worker: confirm the recorder is dead, wrap the raw PCM into a
     WAV, transcribe it, and deliver the text into the originating iTerm session
     (falling back to the clipboard). Runs with no coprocess attached, so nothing
-    here — the wait, the network round-trip — can freeze the terminal."""
+    here — the wait, the network round-trip — can freeze the terminal.
+
+    This is also the only process that knows how a dictation *ended*, so it owns
+    every terminal indicator state and, critically, the teardown: the `finally`
+    below guarantees no glyph or recoloured cursor outlives the worker, whichever
+    path it exits by."""
     t_start = time.monotonic()
     log(f"worker start: raw={raw_path} session={session!r} recorder_pid={pid}")
+
+    # A plain SIGTERM/SIGINT would tear this process down without unwinding, so
+    # the `finally` below would never run and the "thinking" glyph would be left
+    # stranded in the session. Turning the signal into a normal exception path
+    # means an interrupted worker still cleans up after itself. SIGKILL remains
+    # uncatchable by definition — `squawk reset-indicator` is the remedy there.
+    def _on_signal(signum, *_):
+        raise KeyboardInterrupt(f"signal {signum}")
+
+    for sig in (signal.SIGTERM, signal.SIGINT, signal.SIGHUP):
+        try:
+            signal.signal(sig, _on_signal)
+        except (OSError, ValueError):
+            pass
+
     wav_path = None
     try:
         # ptt-stop already SIGKILLed sox, so it is dying essentially now. A brief
@@ -643,6 +903,7 @@ def cmd_finish(cfg, raw_path, session, pid=0, keep_audio=False, keep_newlines=Fa
         if not wav_path:
             log("microphone capture failed (no audio captured)")
             play_sound(SOUND_ERROR)
+            flash_indicator(cfg, "error", tty)
             return 1
 
         audio_sec = os.path.getsize(raw_path) / (16000 * 2)
@@ -655,16 +916,21 @@ def cmd_finish(cfg, raw_path, session, pid=0, keep_audio=False, keep_newlines=Fa
         except Exception as exc:
             log(f"transcription failed: {describe_speech_failure(cfg, exc)}")
             play_sound(SOUND_ERROR)
+            flash_indicator(cfg, "error", tty)
             return 1
 
         text = sanitize(text, keep_newlines)
         if not text:
             play_sound(SOUND_EMPTY)
+            flash_indicator(cfg, "empty", tty)
             return 0
 
         if inject_into_iterm(session, text):
             log(f"delivered {len(text)} chars")
             play_sound(SOUND_SUCCESS)
+            # Flash only after the text has landed, so the glyph never implies
+            # success before delivery actually happened.
+            flash_indicator(cfg, "success", tty)
             return 0
 
         # Originating session is gone (closed tab) or we have no session id:
@@ -673,14 +939,25 @@ def cmd_finish(cfg, raw_path, session, pid=0, keep_audio=False, keep_newlines=Fa
         if copy_to_clipboard(text):
             log("originating session unavailable; transcript copied to clipboard")
             play_sound(SOUND_SUCCESS)
+            flash_indicator(cfg, "success", tty)
             return 0
 
         # Log only the length, never the text — the transcript is the user's
         # private dictation and must not be written to disk on a delivery failure.
         log(f"could not deliver transcript ({len(text)} chars)")
         play_sound(SOUND_ERROR)
+        flash_indicator(cfg, "error", tty)
+        return 1
+    except KeyboardInterrupt as exc:
+        # Raised by the signal handler above. Logged rather than traced so the
+        # worker log stays readable; the `finally` does the actual cleanup.
+        log(f"worker interrupted ({exc}) — clearing indicator")
         return 1
     finally:
+        # Unconditional teardown. Every return above has already flashed its own
+        # terminal state, but an unexpected exception must not leave the
+        # "thinking" glyph and a recoloured cursor stranded in the session.
+        clear_indicator(cfg, tty)
         for p in (raw_path, wav_path):
             if p and os.path.exists(p):
                 if keep_audio:
@@ -690,6 +967,30 @@ def cmd_finish(cfg, raw_path, session, pid=0, keep_audio=False, keep_newlines=Fa
                         os.remove(p)
                     except OSError:
                         pass
+
+
+def cmd_reset_indicator(cfg):
+    """Clear a stuck mode indicator.
+
+    The pipeline tears itself down on every path, but a process killed outright
+    (or a config changed mid-dictation) can still strand a glyph or a recoloured
+    cursor — which is worse than having no indicator at all. Clears the session
+    recorded in the lock file as well as the invoking one, and forces the write
+    even when the indicator is configured off, since that is exactly the state a
+    user who just disabled it would want cleaned up.
+    """
+    _, _, _, lock_tty = read_lock()
+    targets = []
+    for tty in (lock_tty, current_tty(), resolve_session_tty()):
+        if tty and tty not in targets:
+            targets.append(tty)
+    if not targets:
+        print("squawk: no iTerm session found to clear", file=sys.stderr)
+        return 1
+    for tty in targets:
+        clear_indicator(cfg, tty, force=True)
+    print("squawk: cleared mode indicator in " + ", ".join(targets))
+    return 0
 
 
 def probe_mic(cfg):
@@ -1314,6 +1615,14 @@ def cmd_doctor(cfg):
     else:
         report("WARN", "Automation (iTerm)", auto_msg, PANE_AUTOMATION, required=False)
 
+    # Mode indicator — informational only, never a reason to fail: dictation
+    # works fine without it.
+    if cfg.indicator == "off":
+        report("OK", "Mode indicator", "disabled (SQUAWK_INDICATOR=off)", required=False)
+    else:
+        report("OK", "Mode indicator", f"{cfg.indicator} — if a glyph or cursor colour "
+               f"ever gets stuck, run: squawk reset-indicator", required=False)
+
     # Speech backend (verify_backend prints its own [endpoint]/[roundtrip] lines).
     print("\n[backend]")
     if not verify_backend(cfg):
@@ -1491,12 +1800,15 @@ def main(argv=None):
 
     sub.add_parser("doctor", help="check every prerequisite (deps, permissions, backend, agent) and print fixes")
 
+    sub.add_parser("reset-indicator", help="clear a stuck mode indicator (badge and cursor colour) from the current session")
+
     # Internal: the detached transcription+delivery worker spawned by ptt-stop.
     # No help= so it stays out of the documented command list.
     finish_p = sub.add_parser("_finish")
     finish_p.add_argument("wav")
     finish_p.add_argument("--session", default="")
     finish_p.add_argument("--pid", type=int, default=0)
+    finish_p.add_argument("--tty", default="")
     finish_p.add_argument("--keep-audio", action="store_true")
     finish_p.add_argument("--keep-newlines", action="store_true")
 
@@ -1517,15 +1829,17 @@ def main(argv=None):
 
     if args.command == "doctor":
         return cmd_doctor(cfg)
+    if args.command == "reset-indicator":
+        return cmd_reset_indicator(cfg)
 
     if args.command == "dictate":
         return cmd_dictate(cfg, keep_audio=args.keep_audio, keep_newlines=args.keep_newlines)
     if args.command == "ptt-start":
         return cmd_ptt_start(cfg)
     if args.command == "ptt-stop":
-        return cmd_ptt_stop(keep_audio=args.keep_audio, keep_newlines=args.keep_newlines)
+        return cmd_ptt_stop(cfg, keep_audio=args.keep_audio, keep_newlines=args.keep_newlines)
     if args.command == "_finish":
-        return cmd_finish(cfg, args.wav, args.session, pid=args.pid,
+        return cmd_finish(cfg, args.wav, args.session, pid=args.pid, tty=args.tty or None,
                           keep_audio=args.keep_audio, keep_newlines=args.keep_newlines)
     return cmd_check(cfg)
 
