@@ -11,14 +11,16 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>0.1.5</string>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>0.1.5</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>13.0</string>
 	<key>LSUIElement</key>
 	<true/>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>SquawkPTT records push-to-talk audio while you hold your talk key, so squawk can transcribe it.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>squawk types your transcript into the iTerm session you dictated in.</string>
 </dict>
 </plist>

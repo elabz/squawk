@@ -48,6 +48,15 @@ extern char **environ;
 /* Default hold threshold in ms — matches the tuned Karabiner value. */
 #define DEFAULT_HOLD_MS 400.0
 
+/* Recording cap. The helper enforces it because it alone knows when the hold
+ * began: CAP_WARN_SECONDS before the cap it plays the warning cue and runs
+ * `squawk ptt-warn` (badge countdown); at the cap it finishes the dictation
+ * exactly as a release would, so a long recording is transcribed, never lost.
+ * Defaults and the warning lead must match DEFAULT_MAX_SECONDS and
+ * CAP_WARN_SECONDS in squawk.py. */
+#define DEFAULT_MAX_SECONDS 300.0
+#define CAP_WARN_SECONDS 15.0
+
 static char squawk_path[PATH_MAX];
 
 /* Locate the squawk CLI. `install-agent` writes the exact path of the CLI that
@@ -84,6 +93,7 @@ static BOOL resolve_squawk_path(const char *home) {
 }
 
 static double g_hold_ms = DEFAULT_HOLD_MS;
+static double g_max_seconds = DEFAULT_MAX_SECONDS;
 static CFMachPortRef g_tap = NULL;
 
 /* Trigger state machine (all touched only on the main run loop):
@@ -95,6 +105,11 @@ static CFMachPortRef g_tap = NULL;
 static BOOL g_armed = NO;
 static BOOL g_recording = NO;
 static uint64_t g_hold_gen = 0;
+/* Set when this Space press has already been resolved without recording —
+ * emitted early as a typed space (another key went down while it was armed),
+ * or finished by the recording cap. The press's remaining auto-repeats and its
+ * key-up are swallowed so they can't type a second space. */
+static BOOL g_consumed = NO;
 
 /* Set when the legacy Karabiner Space rule is still present: the tap refuses to
  * arm so Space is never grabbed by two owners at once. Re-checked periodically
@@ -115,23 +130,29 @@ static dispatch_queue_t g_squawk_queue;
  * Timeout. Each subcommand is waited on (squawk itself detaches sox and the
  * transcription worker, so these exit in well under a second) purely so the
  * next one cannot overtake it. */
-static void run_squawk(const char *subcommand) {
+static void run_squawk_arg(const char *subcommand, const char *arg);
+static void run_squawk(const char *subcommand) { run_squawk_arg(subcommand, NULL); }
+
+static void run_squawk_arg(const char *subcommand, const char *arg) {
     if (!squawk_path[0]) {
         fprintf(stderr, "squawkptt: cannot run `squawk %s` — no CLI was found at "
                         "startup. Run `squawk install-agent` to record its path.\n",
                 subcommand);
         return;
     }
+    char *arg_copy = arg ? strdup(arg) : NULL; /* outlives the caller's buffer */
     dispatch_async(g_squawk_queue, ^{
-        char *argv[] = {squawk_path, (char *)subcommand, NULL};
+        char *argv[] = {squawk_path, (char *)subcommand, arg_copy, NULL};
         pid_t pid;
         if (posix_spawn(&pid, squawk_path, NULL, NULL, argv, environ) != 0) {
             perror("squawkptt: posix_spawn squawk");
+            free(arg_copy);
             return;
         }
         int status;
         while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
             ;
+        free(arg_copy);
     });
 }
 
@@ -145,6 +166,7 @@ static void run_squawk(const char *subcommand) {
  * does not play them a second time. */
 static NSSound *g_cue_start;
 static NSSound *g_cue_release;
+static NSSound *g_cue_warn; /* CAP_WARN_SECONDS before the recording cap */
 
 /* Even a warm -play costs 10-50 ms on a loaded machine, which must not be spent
  * inside the tap callback (the whole keyboard waits on it). Queued to the main
@@ -177,7 +199,7 @@ static void warm_cue(NSSound *cue) {
  * re-enters the pipeline from the top asynchronously, and a letter typed right
  * after the tap could overtake the space — the "space arrives after the next
  * letter" bug. */
-static void synthesize_space(CGEventTapProxy proxy) {
+static void synthesize_space(CGEventTapProxy proxy, CGEventRef then) {
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)KEYCODE_SPACE, true);
     CGEventRef up = CGEventCreateKeyboardEvent(src, (CGKeyCode)KEYCODE_SPACE, false);
@@ -185,6 +207,19 @@ static void synthesize_space(CGEventTapProxy proxy) {
     CGEventSetIntegerValueField(up, kCGEventSourceUserData, SQUAWK_EVENT_MARKER);
     CGEventTapPostEvent(proxy, down);
     CGEventTapPostEvent(proxy, up);
+    /* `then` is a key the user pressed while Space was still undecided. It is
+     * re-posted (as a marked copy) through the same proxy right behind the
+     * space, rather than returned from the callback, so the two can only ever
+     * arrive in the order they were typed — no reliance on how posted events
+     * interleave with a returned one. */
+    if (then) {
+        CGEventRef copy = CGEventCreateCopy(then);
+        if (copy) {
+            CGEventSetIntegerValueField(copy, kCGEventSourceUserData, SQUAWK_EVENT_MARKER);
+            CGEventTapPostEvent(proxy, copy);
+            CFRelease(copy);
+        }
+    }
     if (down) CFRelease(down);
     if (up) CFRelease(up);
     if (src) CFRelease(src);
@@ -215,7 +250,64 @@ static void abandon_hold(const char *why) {
     }
     g_armed = NO;
     g_recording = NO;
+    g_consumed = NO;
     g_hold_gen++;
+}
+
+/* ── Self-update ──────────────────────────────────────────────────────────
+ * `brew upgrade squawk` replaces the prebuilt, Developer-ID-signed helper in
+ * the keg (…/libexec/squawk/SquawkPTT.app) but cannot touch the running copy
+ * in ~/Applications: Homebrew's sandbox forbids writing to $HOME or loading a
+ * launchd agent. So the helper watches the keg and, once a different bundle
+ * version appears and no dictation is in flight, runs `squawk install-agent`
+ * itself — which copies the new app over this one and restarts the agent.
+ * Because every release carries the same Developer ID signature, the TCC
+ * grants carry over and the upgrade needs nothing from the user.
+ *
+ * Only a *prebuilt* app in the keg counts: a source checkout or the curl
+ * installer would rebuild ad-hoc, which re-prompts for every grant — that must
+ * stay a deliberate `squawk install-agent`, never something done behind the
+ * user's back. */
+
+/* The keg's prebuilt helper, derived from the CLI's real path
+ * (<keg>/bin/squawk → <keg>/libexec/squawk/SquawkPTT.app). Re-derived on each
+ * check, because each upgrade moves the CLI to a new versioned keg. */
+static NSString *keg_helper_version(void) {
+    char real[PATH_MAX];
+    if (!squawk_path[0] || !realpath(squawk_path, real))
+        return nil;
+    NSString *keg = [[[NSString stringWithUTF8String:real]
+        stringByDeletingLastPathComponent] stringByDeletingLastPathComponent];
+    NSString *plist = [keg stringByAppendingPathComponent:
+        @"libexec/squawk/SquawkPTT.app/Contents/Info.plist"];
+    NSDictionary *info = [NSDictionary dictionaryWithContentsOfFile:plist];
+    id v = info[@"CFBundleVersion"];
+    return [v isKindOfClass:[NSString class]] ? v : nil;
+}
+
+static NSString *g_update_attempted; /* tried once per version, never in a loop */
+
+static void maybe_self_update(void) {
+    if (g_armed || g_recording || g_consumed)
+        return; /* never restart under a dictation */
+    NSString *mine = [[NSBundle mainBundle] objectForInfoDictionaryKey:@"CFBundleVersion"];
+    NSString *keg = keg_helper_version();
+    if (!keg || !mine || [keg isEqualToString:mine] || [keg isEqualToString:g_update_attempted])
+        return;
+    g_update_attempted = keg;
+    fprintf(stderr, "squawkptt: Homebrew installed helper %s (running %s) — updating\n",
+            keg.UTF8String, mine.UTF8String);
+    /* Its own session: install-agent boots this agent out, and launchd kills
+     * the job's process group with it — verified; a setsid child survives. */
+    posix_spawnattr_t attr;
+    posix_spawnattr_init(&attr);
+    posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETSID);
+    char *argv[] = {squawk_path, "install-agent", NULL};
+    pid_t pid;
+    if (posix_spawn(&pid, squawk_path, NULL, &attr, argv, environ) != 0)
+        perror("squawkptt: posix_spawn install-agent");
+    posix_spawnattr_destroy(&attr);
+    /* Not waited on: it outlives us by design. Reaped by launchd afterwards. */
 }
 
 /* True if karabiner.json still carries the legacy squawk/vox Space rule. The
@@ -259,6 +351,44 @@ static BOOL legacy_rule_active(void) {
     return found;
 }
 
+/* Arm the cap timers for the recording that just started under hold
+ * generation `gen`. Both are cancelled by any state change (release, abandon),
+ * because they only act while that generation is still current. */
+static double read_config_double(const char *key, double fallback);
+
+static void schedule_cap(uint64_t gen) {
+    /* Re-read per recording (a small file read, off the tap callback) so a
+     * changed SQUAWK_MAX_SECONDS applies without restarting the helper. */
+    double cap = read_config_double("SQUAWK_MAX_SECONDS", g_max_seconds);
+    double started = [[NSDate date] timeIntervalSince1970];
+    if (cap > CAP_WARN_SECONDS * 2) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)((cap - CAP_WARN_SECONDS) * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            if (!g_recording || gen != g_hold_gen)
+                return;
+            play_cue(g_cue_warn);
+            /* The deadline is absolute so the countdown cannot drift by however
+             * long the CLI takes to start. */
+            char deadline[32];
+            snprintf(deadline, sizeof deadline, "%.3f", started + cap);
+            run_squawk_arg("ptt-warn", deadline);
+        });
+    }
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(cap * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        if (!g_recording || gen != g_hold_gen)
+            return;
+        /* Finish exactly like a release, then ignore the real release. */
+        fprintf(stderr, "squawkptt: recording reached the %.0f s cap — finishing it\n", cap);
+        g_recording = NO;
+        g_consumed = YES;
+        g_hold_gen++;
+        play_cue(g_cue_release);
+        run_squawk("ptt-stop");
+    });
+}
+
 static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
                                CGEventRef event, void *refcon) {
     (void)refcon;
@@ -279,13 +409,26 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
     if (type != kCGEventKeyDown && type != kCGEventKeyUp)
         return event;
 
-    int64_t keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
-    if (keycode != KEYCODE_SPACE)
-        return event; /* every non-Space key passes through untouched */
-
-    /* Ignore the synthetic space we post for taps, so we never recurse. */
+    /* Ignore the events we post ourselves, so we never recurse. */
     if (CGEventGetIntegerValueField(event, kCGEventSourceUserData) == SQUAWK_EVENT_MARKER)
         return event;
+
+    int64_t keycode = CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode);
+    if (keycode != KEYCODE_SPACE) {
+        /* Another key went down while Space was still undecided: that is fast
+         * typing with key rollover ("a", Space, "b" with Space released after
+         * "b" went down), never a hold. Resolve the press as a typed space NOW,
+         * ahead of this key. Deciding only on Space's release let "b" through
+         * first and produced "ab " — the misplaced-space bug. */
+        if (type == kCGEventKeyDown && g_armed && g_iterm_front && !g_conflict) {
+            g_armed = NO;
+            g_consumed = YES;
+            g_hold_gen++; /* cancels the pending threshold timer */
+            synthesize_space(proxy, event);
+            return NULL; /* re-posted behind the space by synthesize_space */
+        }
+        return event; /* every other non-Space key passes through untouched */
+    }
 
     /* Only alter Space in iTerm, and never while the legacy rule could also be
      * grabbing it. Any other context is passed through completely unmodified. */
@@ -294,13 +437,16 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
          * hold, stopping the recorder if one was already running. */
         if (g_armed || g_recording)
             abandon_hold("focus left iTerm mid-press");
+        /* The swallowed key-up of a resolved press will now go to another app;
+         * forget it, or the next Space in iTerm would be swallowed instead. */
+        g_consumed = NO;
         return event;
     }
 
     if (type == kCGEventKeyDown) {
-        /* Auto-repeat while armed or recording: swallow so a held Space never
-         * spews spaces. */
-        if (g_armed || g_recording)
+        /* Auto-repeat while armed, recording, or already resolved: swallow so
+         * a held Space never spews spaces. */
+        if (g_armed || g_recording || g_consumed)
             return NULL;
 
         g_armed = YES;
@@ -313,12 +459,17 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
                 g_recording = YES;
                 play_cue(g_cue_start); /* before the spawn: the ack never waits */
                 run_squawk("ptt-start");
+                schedule_cap(gen);
             }
         });
         return NULL; /* swallow the down; we decide tap-vs-hold on release/timer */
     }
 
     /* keyUp */
+    if (g_consumed) {
+        g_consumed = NO; /* already typed early, or finished by the cap */
+        return NULL;
+    }
     if (g_recording) {
         g_recording = NO;
         g_hold_gen++;
@@ -331,7 +482,7 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
          * the generation bump) and emit a real space. */
         g_armed = NO;
         g_hold_gen++;
-        synthesize_space(proxy);
+        synthesize_space(proxy, NULL);
         return NULL;
     }
     return event; /* a Space up we never swallowed the down for — leave it */
@@ -355,8 +506,8 @@ static BOOL install_tap(void) {
 /* Read SQUAWK_HOLD_MS from the environment, then fall back to the squawk config
  * file (~/.config/squawk/config, KEY=value). Ignores non-positive / unparsable
  * values, keeping the default. */
-static double read_hold_ms(void) {
-    const char *env = getenv("SQUAWK_HOLD_MS");
+static double read_config_double(const char *key, double fallback) {
+    const char *env = getenv(key);
     if (env && *env) {
         double v = atof(env);
         if (v > 0)
@@ -370,11 +521,16 @@ static double read_hold_ms(void) {
         if (f) {
             char line[256];
             double found = 0;
+            size_t klen = strlen(key);
             while (fgets(line, sizeof line, f)) {
-                if (strncmp(line, "SQUAWK_HOLD_MS=", 15) == 0) {
-                    double v = atof(line + 15);
-                    if (v > 0)
-                        found = v;
+                if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
+                    /* tolerate quoting, as squawk.py's unquote() does */
+                    const char *v = line + klen + 1;
+                    if (*v == '"' || *v == '\'')
+                        v++;
+                    double d = atof(v);
+                    if (d > 0)
+                        found = d;
                 }
             }
             fclose(f);
@@ -382,7 +538,7 @@ static double read_hold_ms(void) {
                 return found;
         }
     }
-    return DEFAULT_HOLD_MS;
+    return fallback;
 }
 
 int main(void) {
@@ -410,10 +566,13 @@ int main(void) {
                                               byReference:YES];
     g_cue_release = [[NSSound alloc] initWithContentsOfFile:@"/System/Library/Sounds/Ping.aiff"
                                                 byReference:YES];
-    if (!g_cue_start || !g_cue_release)
+    g_cue_warn = [[NSSound alloc] initWithContentsOfFile:@"/System/Library/Sounds/Submarine.aiff"
+                                             byReference:YES];
+    if (!g_cue_start || !g_cue_release || !g_cue_warn)
         fprintf(stderr, "squawkptt: could not load cue sounds — holds will be silent\n");
     warm_cue(g_cue_start);
     warm_cue(g_cue_release);
+    warm_cue(g_cue_warn);
     /* Inherited by every spawned squawk: it skips the cues played above. */
     setenv("SQUAWK_HELPER_CUES", "1", 1);
 
@@ -437,8 +596,10 @@ int main(void) {
             abandon_hold("iTerm deactivated mid-press");
     }];
 
-    g_hold_ms = read_hold_ms();
-    fprintf(stderr, "squawkptt: hold threshold %.0f ms\n", g_hold_ms);
+    g_hold_ms = read_config_double("SQUAWK_HOLD_MS", DEFAULT_HOLD_MS);
+    g_max_seconds = read_config_double("SQUAWK_MAX_SECONDS", DEFAULT_MAX_SECONDS);
+    fprintf(stderr, "squawkptt: hold threshold %.0f ms, recording cap %.0f s\n",
+            g_hold_ms, g_max_seconds);
 
     g_conflict = legacy_rule_active();
     if (g_conflict)
@@ -479,6 +640,13 @@ int main(void) {
         dispatch_source_set_timer(retry, dispatch_time(DISPATCH_TIME_NOW, 3 * NSEC_PER_SEC),
                                   3 * NSEC_PER_SEC, (int64_t)(0.5 * NSEC_PER_SEC));
         dispatch_source_set_event_handler(retry, ^{
+            /* Check silently first. On current macOS a CGEventTapCreate that
+             * fails for lack of Accessibility raises the "would like to control
+             * this Mac" dialog itself — every 3 s from this loop — and that
+             * dialog's default button is Deny, so a Return or Space typed while
+             * it is up denies the grant. The one prompt at launch is enough. */
+            if (!AXIsProcessTrusted())
+                return;
             if (install_tap()) {
                 fprintf(stderr, "squawkptt: event tap active (Accessibility granted)\n");
                 dispatch_source_cancel(retry);
@@ -487,13 +655,15 @@ int main(void) {
         dispatch_resume(retry);
     }
 
-    /* Re-check the legacy conflict periodically so `squawk migrate` clears it
-     * live. Cheap: a small file read every few seconds. */
+    /* Every few seconds: look for a Homebrew-upgraded helper (see
+     * maybe_self_update), and re-check the legacy conflict so `squawk migrate`
+     * clears it live. Cheap: a couple of small file reads. */
     dispatch_source_t recheck = dispatch_source_create(
         DISPATCH_SOURCE_TYPE_TIMER, 0, 0, dispatch_get_main_queue());
     dispatch_source_set_timer(recheck, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
                               5 * NSEC_PER_SEC, (int64_t)NSEC_PER_SEC);
     dispatch_source_set_event_handler(recheck, ^{
+        maybe_self_update();
         BOOL now = legacy_rule_active();
         if (now != g_conflict) {
             g_conflict = now;

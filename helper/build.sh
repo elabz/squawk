@@ -26,8 +26,19 @@ clang -O2 -Wall -fobjc-arc \
     -framework AVFoundation -framework Foundation \
     -framework AppKit -framework ApplicationServices \
     -o "$APP/Contents/MacOS/SquawkPTT" "$SRC_DIR/squawkptt.m"
-# Ad-hoc signature with a STABLE identifier: TCC attaches the mic/Accessibility
-# grants to this code identity, so keeping it fixed minimizes re-prompts across
-# rebuilds and upgrades.
-codesign --force --sign - --identifier sh.squawk.ptt "$APP"
+# Signing. With SQUAWK_SIGN_IDENTITY set (a "Developer ID Application: …"
+# identity — what the release script uses), the app gets a real signature with
+# the hardened runtime, a secure timestamp and the entitlements notarization
+# needs. macOS then keys the Microphone / Accessibility / Input Monitoring
+# grants to "identifier sh.squawk.ptt from this team", which every future build
+# also satisfies — grants survive upgrades. Without it, an ad-hoc signature
+# with a stable identifier; macOS keys ad-hoc grants to the CDHash, so any
+# source change re-prompts once.
+if [ -n "${SQUAWK_SIGN_IDENTITY:-}" ]; then
+    codesign --force --options runtime --timestamp \
+        --entitlements "$SRC_DIR/SquawkPTT.entitlements" \
+        --sign "$SQUAWK_SIGN_IDENTITY" --identifier sh.squawk.ptt "$APP"
+else
+    codesign --force --sign - --identifier sh.squawk.ptt "$APP"
+fi
 echo "Built $APP"

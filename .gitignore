@@ -13,3 +13,6 @@ helper/SquawkPTT.app/
 # Editor
 .idea/
 .vscode/
+
+# Release build output (packaging/release-helper.sh)
+dist/

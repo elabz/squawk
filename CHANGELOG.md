@@ -1,5 +1,56 @@
 # Changelog
 
+## v0.1.5 — 2026-10-23
+
+**Hands-off upgrades, long recordings that are never lost, and spaces that
+land where you typed them.**
+
+### Upgrades are hands-off
+
+- **The helper is now signed with a Developer ID and notarized.** macOS ties
+  the Microphone / Accessibility / Input Monitoring grants to "SquawkPTT from
+  this developer" instead of to one build's code hash, so **upgrades no longer
+  re-prompt**, and there is no stale Input Monitoring entry to remove.
+- **The helper updates itself.** After `brew upgrade squawk`, the running
+  helper notices the new version in the Homebrew keg within a few seconds,
+  waits until no dictation is in progress, and re-runs `squawk install-agent`
+  on its own. `brew upgrade squawk` is the whole upgrade.
+- The formula installs the prebuilt helper, so **Xcode / Command Line Tools
+  are no longer needed** to install squawk via Homebrew.
+
+### Long recordings are never lost
+
+- **Holding past the recording cap silently threw the whole dictation away.**
+  At 60 s the recorder stopped itself; on release `ptt-stop` found it gone,
+  decided nothing was recording, and discarded the session. The audio was
+  left on disk, untranscribed, and nothing warned you the cap was close. Now:
+  - The default cap is **5 minutes** (`SQUAWK_MAX_SECONDS=300`).
+  - **15 s before the cap** a warning chime plays and the badge counts down
+    (`🎤 15s` … `🎤 1s`).
+  - **At the cap** the helper finishes the dictation exactly like a release.
+    It is transcribed and delivered, and the real release is ignored.
+  - `ptt-stop` always transcribes whatever was captured, even if the recorder
+    already ended (e.g. under an older helper).
+- **A failed transcription or delivery no longer deletes the audio.** It is
+  kept in `~/.local/state/squawk/failed/`, and the new **`squawk recover`**
+  command transcribes it, plus any capture an older squawk stranded in the temp
+  dir, and copies the text to the clipboard.
+
+### Spaces land where you typed them
+
+- **Typing fast put the space one character late** ("ab c" for "a bc"). The
+  helper held each Space back until release to tell a tap from a hold, so a
+  key pressed *before* Space came back up (normal rollover) overtook it. A
+  key press while Space is still undecided now resolves it as a typed space at
+  once, emitted ahead of that key.
+
+**Upgrading from 0.1.4 or older:** run `squawk install-agent` once after
+`brew upgrade squawk` and re-grant SquawkPTT (Accessibility, labelled "Device
+Control and Data Access" on newer macOS, plus Input Monitoring and Microphone).
+If Space does nothing, remove the old SquawkPTT entry under Input Monitoring
+with "–" and add it back. This is the last time: from here on, upgrades keep
+their grants and apply themselves.
+
 ## v0.1.4 — 2026-10-23
 
 **Instant push-to-talk cues, even on a busy machine, plus three reliability

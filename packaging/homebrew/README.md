@@ -30,26 +30,46 @@ git add Formula/squawk.rb && git commit -m "squawk 0.1.0" && git push
 
 ## Version bump procedure (each release)
 
-1. Tag and push a release in the `elabz/squawk` repo, e.g. `v0.1.0`.
-2. Compute the tarball checksum:
+Needs the maintainer's **Developer ID Application** certificate in the keychain
+and notarization credentials stored once with
+`xcrun notarytool store-credentials squawk-notary --apple-id <id> --team-id <team>`
+(an app-specific password from account.apple.com, not the Apple ID password).
+
+1. Set `CFBundleVersion` and `CFBundleShortVersionString` in
+   `helper/Info.plist` to the new version. The helper's self-update compares
+   this value, and the release script refuses to run if it doesn't match.
+2. Commit, tag and push the release in `elabz/squawk`, e.g. `v0.1.5`.
+3. Build the signed, notarized helper:
 
    ```sh
-   curl -fsSL https://github.com/elabz/squawk/archive/refs/tags/v0.1.0.tar.gz \
+   packaging/release-helper.sh 0.1.5   # → dist/SquawkPTT-0.1.5.zip + its sha256
+   ```
+
+4. Create the GitHub release for the tag with that zip attached:
+
+   ```sh
+   gh release create v0.1.5 dist/SquawkPTT-0.1.5.zip --notes-file <notes>
+   ```
+
+5. Compute the source tarball checksum:
+
+   ```sh
+   curl -fsSL https://github.com/elabz/squawk/archive/refs/tags/v0.1.5.tar.gz \
      | shasum -a 256
    ```
 
-3. In `squawk.rb`, update **both** `url` (the tag) and `sha256` (the value from
-   step 2). These two lines are the entire bump.
-4. Copy the updated `squawk.rb` into the tap's `Formula/` and push.
-5. Verify: `brew update && brew upgrade squawk` on a machine with the tap tapped.
-
-> The placeholder `sha256` (all zeros) in `squawk.rb` MUST be replaced with the
-> real checksum before the formula will install — Homebrew verifies it.
-
-Optional later automation: a GitHub Actions release workflow that computes the
-sha and opens the tap PR automatically. Not built yet.
+6. In `squawk.rb`, update the top-level `url` + `sha256` (tarball) **and** the
+   `helper` resource's `url` + `sha256` (the zip from step 3).
+7. Copy the updated `squawk.rb` into the tap's `Formula/` and push.
+8. Verify: `brew update && brew upgrade squawk`. Within a few seconds the
+   running helper logs `Homebrew installed helper … — updating` and restarts
+   on the new version, with its grants intact.
 
 ## TCC re-prompts across builds
+
+> Since v0.1.5 the formula installs a **Developer-ID-signed, prebuilt** helper,
+> so grants are keyed to the team identity and survive upgrades; the notes below
+> apply to ad-hoc builds (source checkouts, the curl installer, v0.1.4 and older).
 
 `build.sh` ad-hoc-signs with the fixed identifier `sh.squawk.ptt`, but macOS
 keys an ad-hoc app's privacy grants to its **CDHash**, which tracks the

@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!-- Entitlements for a Developer ID (hardened runtime) build of SquawkPTT.
+     The hardened runtime that notarization requires denies these resources
+     unless they are declared here, and it does so silently: without
+     audio-input the mic grant reads as authorized yet sox records nothing,
+     because TCC checks the responsible process (this app) for the recorder it
+     spawns. apple-events covers the osascript children that type the
+     transcript into iTerm and look up the session tty. Ad-hoc builds run
+     without the hardened runtime and ignore this file. -->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

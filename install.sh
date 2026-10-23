@@ -40,7 +40,8 @@ echo "Installed squawk CLI -> $BIN_DIR/squawk"
 # 2. Helper build inputs where `squawk install-agent` discovers them.
 mkdir -p "$SHARE_DIR"
 cp "$SRC/helper/squawkptt.m" "$SRC/helper/Info.plist" \
-   "$SRC/helper/build.sh" "$SRC/helper/sh.squawk.ptt.plist" "$SHARE_DIR/"
+   "$SRC/helper/build.sh" "$SRC/helper/sh.squawk.ptt.plist" \
+   "$SRC/helper/SquawkPTT.entitlements" "$SHARE_DIR/"
 chmod +x "$SHARE_DIR/build.sh"
 echo "Staged helper sources -> $SHARE_DIR"
 

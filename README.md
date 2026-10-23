@@ -90,7 +90,7 @@ file:
 | `SQUAWK_SPEECH_KEY` | *(none — many local servers need none)* | Bearer key for the endpoint |
 | `SQUAWK_STT_MODEL` | `whisper-1` | Model id for transcription |
 | `SQUAWK_SILENCE_STOP` | `1.5` | Seconds of trailing silence that stops recording |
-| `SQUAWK_MAX_SECONDS` | `60` | Hard cap on recording duration |
+| `SQUAWK_MAX_SECONDS` | `300` | Cap on one push-to-talk recording. A warning chime and a badge countdown start 15 s before it; at the cap the dictation is finished and transcribed, never dropped |
 | `SQUAWK_INPUT_DEVICE` | `default` | Passed as `AUDIODEV` to sox when not `default` |
 | `SQUAWK_INDICATOR` | `both` | Visual mode indicator: `both`, `badge`, `cursor`, or `off` |
 | `SQUAWK_INDICATOR_GLYPH_<STATE>` | see below | Override the glyph for one state |
@@ -324,6 +324,19 @@ the terminal keyboard:
    frontmost session via its scripting `write` verb (Automation permission) —
    this lands in full-screen TUIs too.
 
+**Long recordings.** A hold is capped at `SQUAWK_MAX_SECONDS` (default 5
+minutes). 15 seconds before the cap you hear a warning chime (Submarine) and the
+badge counts down (`🎤 15s`, `🎤 14s`, …). At the cap squawk finishes the
+dictation exactly as if you had released Space: you hear the release
+chime, the text is transcribed and typed, and the eventual real release is
+ignored. Nothing is ever dropped. If transcription or delivery fails, the audio
+is kept in `~/.local/state/squawk/failed/` and `squawk recover` transcribes it.
+
+**Typing fast.** If you press another key while Space is still down (normal
+rollover when typing quickly), that press counts as an ordinary space, emitted
+before the next character. So spaces always land where you typed them, and a
+quick space never starts a recording.
+
 Install/update the helper. With squawk on `PATH` (brew or curl install) this is
 just:
 
@@ -394,14 +407,15 @@ Accessibility / Input Monitoring grants accurately (a process can't query
 another app's TCC state directly), tests Automation by driving iTerm, and
 flags a lingering Karabiner rule.
 
-> **Expect one re-prompt when you switch install methods.** SquawkPTT is
-> ad-hoc-signed with a stable identifier (`sh.squawk.ptt`), but macOS keys an
-> ad-hoc app's privacy grants to its *CDHash*, which tracks the compiled bytes.
-> Homebrew builds with different compiler flags than a hand-run
-> `helper/install.sh`, so moving from one to the other produces a different
-> hash and macOS asks for Microphone / Accessibility / Input Monitoring again,
-> once. Routine `brew upgrade`s only re-prompt when the helper source actually
-> changed.
+> **Upgrades keep their grants (Homebrew).** Since v0.1.5 the Homebrew formula
+> installs a prebuilt SquawkPTT signed with the maintainer's Developer ID and
+> notarized by Apple. macOS ties its Microphone / Accessibility / Input
+> Monitoring grants to that signing identity, which every release shares, so
+> `brew upgrade` never re-prompts. The running helper also installs the
+> upgraded version by itself. A source build (raw checkout or the curl
+> installer) is ad-hoc-signed instead: macOS ties those grants to the compiled
+> bytes, so a helper source change re-prompts once, and switching between a
+> source build and the Homebrew build re-prompts once too.
 
 Two hard-won TCC rules baked into the design:
 
@@ -483,6 +497,10 @@ message and remediation.
   removes the old hold-Space rule (backing up `karabiner.json`), unloads the
   legacy `org.elabz.voxptt` agent, and prints exact rollback steps. Safe to run
   when there's nothing to migrate (it says so and changes nothing).
+- `squawk recover` — transcribe every recording that never reached you (a
+  failed transcription or delivery, or a capped recording an older squawk
+  dropped), print each transcript, and copy them all to the clipboard. A
+  recording is deleted only once its transcript has been printed.
 - `squawk reset-indicator` — clear a stuck [mode indicator](#mode-indicator)
   (badge and cursor colour). Only needed if a dictation was killed before it
   could clean up after itself.

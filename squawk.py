@@ -4,7 +4,10 @@ OpenAI-compatible speech endpoint, and print the transcript to stdout."""
 
 import argparse
 import base64
+import contextlib
+import fcntl
 import getpass
+import math
 import http.client
 import json
 import os
@@ -28,7 +31,7 @@ from dataclasses import dataclass
 DEFAULT_SPEECH_URL = "https://api.openai.com/v1"
 DEFAULT_STT_MODEL = "whisper-1"
 DEFAULT_SILENCE_STOP = "1.5"
-DEFAULT_MAX_SECONDS = "60"
+DEFAULT_MAX_SECONDS = "300"
 DEFAULT_INPUT_DEVICE = "default"
 
 # Hosts that will never accept an anonymous request, so a missing key is worth
@@ -46,6 +49,14 @@ SOUND_ACK = "/System/Library/Sounds/Ping.aiff"  # played the instant Space is re
 SOUND_SUCCESS = "/System/Library/Sounds/Glass.aiff"
 SOUND_EMPTY = "/System/Library/Sounds/Tink.aiff"
 SOUND_ERROR = "/System/Library/Sounds/Basso.aiff"
+# The recording cap is enforced by SquawkPTT, which knows when the hold began:
+# CAP_WARN_SECONDS before SQUAWK_MAX_SECONDS it plays a warning cue and runs
+# `ptt-warn` (the badge counts down), and at the cap it finishes the dictation
+# exactly as a release would. sox's own trim sits CAP_GRACE_SECONDS past the
+# cap purely as a backstop, so the helper always gets there first. Keep
+# CAP_WARN_SECONDS in step with CAP_WARN_SECONDS in squawkptt.m.
+CAP_WARN_SECONDS = 15
+CAP_GRACE_SECONDS = 5
 
 # Visual mode indicator: the same states the sounds above signal, rendered as a
 # glyph in the iTerm session so "mic is hot" and "still thinking" are visible and
@@ -77,6 +88,10 @@ INDICATOR_MODES = ("both", "badge", "cursor", "off")
 DEFAULT_INDICATOR = "both"
 
 LOCK_PATH = os.path.join(tempfile.gettempdir(), "squawk.lock")
+COUNTDOWN_LOCK_PATH = os.path.join(tempfile.gettempdir(), "squawk-countdown.lock")
+# Audio whose transcription failed is moved here instead of deleted, so a long
+# dictation is never lost to a network blip; `squawk recover` transcribes it.
+FAILED_DIR = os.path.expanduser("~/.local/state/squawk/failed")
 WORKER_LOG = os.path.join(tempfile.gettempdir(), "squawk-worker.log")
 SOX_LOG = os.path.join(tempfile.gettempdir(), "squawk-sox.log")
 
@@ -365,13 +380,16 @@ def resolve_session_tty():
     return None
 
 
-def indicator_sequences(cfg, state):
+def indicator_sequences(cfg, state, badge=None):
     """The escape sequences that paint `state`, honouring the configured surfaces.
-    A state of None means "clear". Returns "" when nothing should be written."""
+    A state of None means "clear". `badge` replaces the state's glyph as the
+    badge text (the cap countdown). Returns "" when nothing should be written."""
     if cfg.indicator == "off":
         return ""
     parts = []
     glyph = cfg.indicator_glyphs.get(state, "") if state else ""
+    if badge is not None:
+        glyph = badge
     if cfg.indicator in ("both", "badge"):
         # The badge is session chrome, not grid content, so a full-screen TUI and
         # a shell prompt both leave it alone. The user var is invisible unless the
@@ -387,9 +405,9 @@ def indicator_sequences(cfg, state):
     return "".join(parts)
 
 
-def set_indicator(cfg, state, tty):
+def set_indicator(cfg, state, tty, badge=None):
     """Paint `state` into the given session. Silent no-op without a usable tty."""
-    _write_tty(tty, indicator_sequences(cfg, state))
+    _write_tty(tty, indicator_sequences(cfg, state, badge))
 
 
 def clear_indicator(cfg, tty, force=False):
@@ -783,7 +801,7 @@ def cmd_ptt_start(cfg):
     cmd = [
         SOX, "-d", "-c", "1", "-r", "16000", "-b", "16",
         "-e", "signed-integer", "-t", "raw", raw_path,
-        "trim", "0", str(cfg.max_seconds),
+        "trim", "0", str(cfg.max_seconds + CAP_GRACE_SECONDS),
     ]
     try:
         # No start_new_session here: sox must stay in SquawkPTT's TCC
@@ -837,12 +855,27 @@ def cmd_ptt_stop(cfg, keep_audio=False, keep_newlines=False):
     # worker), then return at once. If nothing was recording, silently no-op.
     pid, raw_path, session, tty = read_lock()
     if not pid or not pid_alive(pid):
+        if raw_has_audio(raw_path):
+            # The recorder already ended on its own — it hit its trim backstop
+            # (an older helper never enforced the cap) or died. The audio it
+            # captured is complete; transcribe it. Dropping it here is how long
+            # dictations used to vanish without a trace.
+            log(f"ptt-stop: recorder pid={pid} already ended — transcribing what it captured")
+            if not helper_plays_cues():
+                play_sound(SOUND_ACK)
+            release_lock()
+            with countdown_guard():
+                set_indicator(cfg, "transcribing", tty)
+            if not spawn_finish(0, raw_path, session, tty, keep_audio, keep_newlines):
+                flash_indicator(cfg, "error", tty)
+                return 1
+            return 0
         # The helper believed a recording was in flight but there is no live
-        # lock — a crashed ptt-start, a helper restart mid-hold, or residue
-        # from an older race. Heal instead of no-opping: make sure no orphaned
-        # recorder keeps the mic, and clear any indicator stranded in the
-        # session the lock still points at (or the frontmost one), so the red
-        # cursor / mic icon can never outlive the recording.
+        # lock and no audio — a crashed ptt-start, a helper restart mid-hold, or
+        # residue from an older race. Heal instead of no-opping: make sure no
+        # orphaned recorder keeps the mic, and clear any indicator stranded in
+        # the session the lock still points at (or the frontmost one), so the
+        # red cursor / mic icon can never outlive the recording.
         release_lock()
         kill_stale_recorders()
         clear_indicator(cfg, tty or resolve_session_tty())
@@ -855,15 +888,18 @@ def cmd_ptt_stop(cfg, keep_audio=False, keep_newlines=False):
     log(f"ptt-stop: release -> SIGKILL sox pid={pid}")
     if not helper_plays_cues():
         play_sound(SOUND_ACK)  # immediate "released, on it" cue
-    # The tty was resolved at ptt-start, so this is a single free write — the
-    # "thinking" glyph appears the moment Space comes up, which is the whole
-    # point of the feature: the 1-3 s transcription gap becomes visible.
-    set_indicator(cfg, "transcribing", tty)
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
         pass
     release_lock()
+    # The tty was resolved at ptt-start, so this is a single free write — the
+    # "thinking" glyph appears the moment Space comes up, which is the whole
+    # point of the feature: the 1-3 s transcription gap becomes visible. Painted
+    # after the lock is gone and under the countdown guard, so a countdown tick
+    # in flight can never land on top of it.
+    with countdown_guard():
+        set_indicator(cfg, "transcribing", tty)
 
     if not spawn_finish(pid, raw_path, session, tty, keep_audio, keep_newlines):
         # The worker never started, so nothing downstream will ever clear the
@@ -873,6 +909,140 @@ def cmd_ptt_stop(cfg, keep_audio=False, keep_newlines=False):
         flash_indicator(cfg, "error", tty)
         return 1
     return 0
+
+
+def raw_has_audio(raw_path):
+    """True if a ptt capture file holds more than a few ms of audio."""
+    try:
+        return bool(raw_path) and os.path.getsize(raw_path) >= 320
+    except OSError:
+        return False
+
+
+@contextlib.contextmanager
+def countdown_guard():
+    """Serialize indicator writes between the cap countdown and ptt-stop.
+
+    The countdown checks "still recording?" and then paints; without a shared
+    lock, ptt-stop could paint the "thinking" glyph in between and the stale
+    countdown would land on top of it. Both critical sections are a lock-file
+    read plus a non-blocking tty write, so the wait is microseconds."""
+    try:
+        fd = os.open(COUNTDOWN_LOCK_PATH, os.O_CREAT | os.O_RDWR, 0o600)
+    except OSError:
+        yield  # best-effort, like every indicator write
+        return
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)
+
+
+def cmd_ptt_warn(cfg, deadline):
+    """Run by SquawkPTT CAP_WARN_SECONDS before the recording cap (it has
+    already played the warning cue). Hands the per-second badge countdown to a
+    detached process and returns at once: the helper runs subcommands one at a
+    time, so a 15 s loop here would hold up the ptt-stop queued behind it."""
+    pid, _, _, tty = read_lock()
+    if not pid or not pid_alive(pid) or not tty or cfg.indicator == "off":
+        return 0
+    try:
+        with open(WORKER_LOG, "ab") as logf:
+            subprocess.Popen(
+                [sys.executable, os.path.realpath(__file__), "_countdown", str(deadline)],
+                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=logf,
+                start_new_session=True,
+            )
+    except OSError as exc:
+        log(f"could not start cap countdown: {exc}")
+    return 0
+
+
+def cmd_countdown(cfg, deadline):
+    """Detached: show the seconds left before the cap in the badge ("🎤 15s"),
+    once per second, until the cap or until the recording ends. `deadline` is
+    the cap as a Unix time, computed by the helper from the moment the hold
+    began, so a slow start of this process cannot make the count drift."""
+    glyph = cfg.indicator_glyphs.get("recording", "")
+    while True:
+        remaining = deadline - time.time()
+        left = math.ceil(remaining)
+        if left <= 0:
+            return 0
+        with countdown_guard():
+            pid, _, _, tty = read_lock()
+            if not pid or not pid_alive(pid):
+                return 0  # released (or capped) — ptt-stop owns the indicator now
+            set_indicator(cfg, "recording", tty, badge=f"{glyph} {left}s")
+        # Sleep to the next whole-second boundary of the remaining time.
+        time.sleep(max(0.05, remaining - (left - 1)))
+
+
+def preserve_failed_audio(raw_path):
+    """Move a capture whose transcript could not be delivered to FAILED_DIR
+    instead of deleting it. Returns the new path, or None."""
+    if not raw_has_audio(raw_path):
+        return None
+    try:
+        os.makedirs(FAILED_DIR, mode=0o700, exist_ok=True)
+        dst = os.path.join(FAILED_DIR, time.strftime("%Y%m%d-%H%M%S-") + os.path.basename(raw_path))
+        shutil.move(raw_path, dst)
+        return dst
+    except OSError as exc:
+        log(f"could not preserve audio {raw_path}: {exc}")
+        return None
+
+
+def recoverable_recordings():
+    """Captures that never produced a delivered transcript, oldest first: those
+    the worker preserved after a failure, plus any ptt capture stranded in the
+    temp dir by an older squawk (which dropped recordings that hit the cap).
+    The capture a live recording is writing right now is excluded."""
+    pid, live_raw, _, _ = read_lock()
+    live = live_raw if pid and pid_alive(pid) else None
+    found = []
+    if os.path.isdir(FAILED_DIR):
+        found += [os.path.join(FAILED_DIR, n) for n in os.listdir(FAILED_DIR) if n.endswith(".raw")]
+    tmp = tempfile.gettempdir()
+    found += [os.path.join(tmp, n) for n in os.listdir(tmp)
+              if n.startswith("squawk-ptt-") and n.endswith(".raw")]
+    found = [p for p in found if p != live and raw_has_audio(p)]
+    return sorted(found, key=os.path.getmtime)
+
+
+def cmd_recover(cfg):
+    """Transcribe every recording that never got delivered, print each
+    transcript, and copy them all to the clipboard. A recording is deleted only
+    once its transcript has been printed."""
+    pending = recoverable_recordings()
+    if not pending:
+        print("squawk: no unrecovered recordings.", file=sys.stderr)
+        return 0
+    texts, failed = [], 0
+    for raw in pending:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(raw)))
+        secs = os.path.getsize(raw) / (16000 * 2)
+        wav = wrap_raw_as_wav(raw)
+        try:
+            text = sanitize(transcribe(wav, cfg), False)
+        except Exception as exc:
+            failed += 1
+            print(f"squawk: {when} ({secs:.0f}s): transcription failed — "
+                  f"{describe_speech_failure(cfg, exc)}; kept {raw}", file=sys.stderr)
+            continue
+        finally:
+            if wav and os.path.exists(wav):
+                os.remove(wav)
+        print(f"--- {when} ({secs:.0f}s of audio)")
+        print(text or "(no speech detected)")
+        sys.stdout.flush()
+        if text:
+            texts.append(text)
+        os.remove(raw)
+    if texts and copy_to_clipboard("\n\n".join(texts)):
+        print(f"squawk: {len(texts)} transcript(s) copied to the clipboard.", file=sys.stderr)
+    return 1 if failed else 0
 
 
 def cmd_finish(cfg, raw_path, session, pid=0, tty=None, keep_audio=False, keep_newlines=False):
@@ -903,6 +1073,9 @@ def cmd_finish(cfg, raw_path, session, pid=0, tty=None, keep_audio=False, keep_n
             pass
 
     wav_path = None
+    # Set on any path that ends without the transcript reaching the user; the
+    # `finally` then keeps the audio for `squawk recover` instead of deleting it.
+    preserve = False
     try:
         # ptt-stop already SIGKILLed sox, so it is dying essentially now. A brief
         # poll (cap ~0.5s) confirms the kernel released the file; because raw PCM
@@ -930,7 +1103,9 @@ def cmd_finish(cfg, raw_path, session, pid=0, tty=None, keep_audio=False, keep_n
                 f"transcribe={t_transcribed - t_flushed:.2f}s "
                 f"audio={audio_sec:.1f}s total-in-worker={t_transcribed - t_start:.2f}s")
         except Exception as exc:
-            log(f"transcription failed: {describe_speech_failure(cfg, exc)}")
+            log(f"transcription failed: {describe_speech_failure(cfg, exc)} — "
+                f"audio kept; run `squawk recover`")
+            preserve = True
             play_sound(SOUND_ERROR)
             flash_indicator(cfg, "error", tty)
             return 1
@@ -960,20 +1135,27 @@ def cmd_finish(cfg, raw_path, session, pid=0, tty=None, keep_audio=False, keep_n
 
         # Log only the length, never the text — the transcript is the user's
         # private dictation and must not be written to disk on a delivery failure.
-        log(f"could not deliver transcript ({len(text)} chars)")
+        log(f"could not deliver transcript ({len(text)} chars) — audio kept; "
+            f"run `squawk recover`")
+        preserve = True
         play_sound(SOUND_ERROR)
         flash_indicator(cfg, "error", tty)
         return 1
     except KeyboardInterrupt as exc:
         # Raised by the signal handler above. Logged rather than traced so the
         # worker log stays readable; the `finally` does the actual cleanup.
-        log(f"worker interrupted ({exc}) — clearing indicator")
+        log(f"worker interrupted ({exc}) — clearing indicator, audio kept")
+        preserve = True
         return 1
     finally:
         # Unconditional teardown. Every return above has already flashed its own
         # terminal state, but an unexpected exception must not leave the
         # "thinking" glyph and a recoloured cursor stranded in the session.
         clear_indicator(cfg, tty)
+        if preserve and not keep_audio:
+            kept = preserve_failed_audio(raw_path)
+            if kept:
+                log(f"kept audio for recovery at {kept}")
         for p in (raw_path, wav_path):
             if p and os.path.exists(p):
                 if keep_audio:
@@ -1391,6 +1573,15 @@ def cmd_install_agent():
             shutil.rmtree(APP_DST, ignore_errors=True)
         shutil.copytree(prebuilt, APP_DST)
         print(f"Installed prebuilt {APP_NAME} -> {APP_DST}")
+        # The release app is Developer-ID-signed and notarized; that signature
+        # is what lets the TCC grants survive upgrades. Anything that rewrote
+        # the bundle on its way here would break it, and macOS would then
+        # silently refuse the mic and the event tap — so check, loudly.
+        v = subprocess.run(["codesign", "--verify", "--strict", APP_DST],
+                           capture_output=True, text=True)
+        if v.returncode != 0:
+            print(f"squawk: WARNING — {APP_NAME}'s signature does not verify "
+                  f"({v.stderr.strip()}). Reinstall squawk.", file=sys.stderr)
     else:
         build = os.path.join(helper_dir, "build.sh")
         print(f"Building {APP_NAME} from source in {helper_dir} …")
@@ -1804,6 +1995,8 @@ def main(argv=None):
     ptt_stop_p.add_argument("--keep-audio", action="store_true", help="do not delete the captured WAV file")
     ptt_stop_p.add_argument("--keep-newlines", action="store_true", help="do not collapse internal newlines")
 
+    sub.add_parser("recover", help="transcribe recordings that never got delivered and copy them to the clipboard")
+
     sub.add_parser("setup", help="choose a speech backend interactively and save it to ~/.config/squawk/config")
 
     sub.add_parser("check", help="verify mic capture and speech endpoint health")
@@ -1817,6 +2010,13 @@ def main(argv=None):
     sub.add_parser("doctor", help="check every prerequisite (deps, permissions, backend, agent) and print fixes")
 
     sub.add_parser("reset-indicator", help="clear a stuck mode indicator (badge and cursor colour) from the current session")
+
+    # Internal: run by SquawkPTT near the recording cap, and the detached badge
+    # countdown it starts. The argument is the cap as a Unix time.
+    warn_p = sub.add_parser("ptt-warn")
+    warn_p.add_argument("deadline", type=float)
+    countdown_p = sub.add_parser("_countdown")
+    countdown_p.add_argument("deadline", type=float)
 
     # Internal: the detached transcription+delivery worker spawned by ptt-stop.
     # No help= so it stays out of the documented command list.
@@ -1854,6 +2054,12 @@ def main(argv=None):
         return cmd_ptt_start(cfg)
     if args.command == "ptt-stop":
         return cmd_ptt_stop(cfg, keep_audio=args.keep_audio, keep_newlines=args.keep_newlines)
+    if args.command == "ptt-warn":
+        return cmd_ptt_warn(cfg, args.deadline)
+    if args.command == "_countdown":
+        return cmd_countdown(cfg, args.deadline)
+    if args.command == "recover":
+        return cmd_recover(cfg)
     if args.command == "_finish":
         return cmd_finish(cfg, args.wav, args.session, pid=args.pid, tty=args.tty or None,
                           keep_audio=args.keep_audio, keep_newlines=args.keep_newlines)
