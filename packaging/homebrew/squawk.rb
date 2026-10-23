@@ -30,7 +30,10 @@ class Squawk < Formula
     # notices each `brew upgrade` here and re-runs install-agent itself.
     helper = libexec/"squawk"
     helper.install "helper/sh.squawk.ptt.plist"
-    resource("helper").stage { helper.install "SquawkPTT.app" }
+    # The zip's only top-level entry is SquawkPTT.app, and Homebrew stages a
+    # single-directory archive from *inside* that directory — so stage the
+    # bundle's contents into the target rather than installing it by name.
+    resource("helper").stage(helper/"SquawkPTT.app")
   end
 
   def caveats
