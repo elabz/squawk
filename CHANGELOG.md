@@ -1,9 +1,24 @@
 # Changelog
 
-## Unreleased
+## v0.1.4 — 2026-10-23
 
-**Fixes three push-to-talk reliability bugs**, all in the SquawkPTT helper's
-event handling:
+**Instant push-to-talk cues, even on a busy machine, plus three reliability
+fixes** in the SquawkPTT helper.
+
+### Latency
+
+- **The start and release cues are now instant, even under load.** They were
+  played by the squawk CLI, so each one waited on a Python launch plus an
+  `afplay` exec. SquawkPTT now preloads both sounds and plays them itself the
+  moment the hold registers or Space comes up; the CLI skips them when
+  `SQUAWK_HELPER_CUES=1` is set (an older helper still gets them from the CLI).
+- **Multi-second delays on a busy machine** before the start cue, the
+  "thinking" glyph, and delivery. The LaunchAgent had no `ProcessType`, so
+  launchd throttled the helper and every process it spawns (python, sox,
+  afplay, osascript); under heavy load each step took seconds instead of
+  ~0.3 s. The agent now runs as `ProcessType = Interactive`.
+
+### Reliability
 
 - **A tapped (not held) Space could land *after* letters typed right behind
   it** ("fro mthe" instead of "from the"). The synthetic space for a tap was
@@ -29,22 +44,13 @@ event handling:
   - `squawk ptt-stop` finding no live recording now heals instead of silently
     no-opping: it kills any orphaned recorder and clears a stranded indicator.
 
-- **Multi-second delays on a busy machine** before the start cue, the
-  "thinking" glyph, and delivery. The LaunchAgent had no `ProcessType`, so
-  launchd throttled the helper and every process it spawns (python, sox,
-  afplay, osascript); under heavy load each step took seconds instead of
-  ~0.3 s. The agent now runs as `ProcessType = Interactive`.
-
-- **The start and release cues are now instant, even under load.** They were
-  played by the squawk CLI, so each one waited on a Python launch plus an
-  `afplay` exec. SquawkPTT now preloads both sounds and plays them itself the
-  moment the hold registers or Space comes up; the CLI skips them when
-  `SQUAWK_HELPER_CUES=1` is set (an older helper still gets them from the CLI).
-
-**Upgrading:** this changes `helper/squawkptt.m`, so run `squawk install-agent`
-after upgrading and expect macOS to re-prompt for the helper's
-Microphone / Accessibility / Input Monitoring grants (the rebuilt binary has a
-new code hash).
+**Upgrading:** this changes `helper/squawkptt.m` and the LaunchAgent plist, so
+run `squawk install-agent` after `brew upgrade squawk`. macOS re-prompts for the
+helper's grants because the rebuilt binary has a new code hash. Re-enable
+SquawkPTT under Accessibility (labelled "Device Control and Data Access" on
+newer macOS). If Space still does nothing, **remove** the old SquawkPTT entry
+under Input Monitoring with "–": it stays tied to the previous build and
+blocks the keyboard hook.
 
 ## v0.1.3 — 2026-07-25
 
