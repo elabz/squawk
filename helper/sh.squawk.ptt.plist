@@ -10,6 +10,12 @@
 	<true/>
 	<key>KeepAlive</key>
 	<true/>
+	<!-- Without ProcessType, launchd applies "light resource limits" that
+	     throttle CPU and I/O for the helper AND every child it spawns (python,
+	     sox, afplay, osascript). On a busy machine that turned the ~0.3 s
+	     keypress-to-cue path into 2-15 s. Interactive = the user is waiting. -->
+	<key>ProcessType</key>
+	<string>Interactive</string>
 	<key>StandardErrorPath</key>
 	<string>__HOME__/Library/Logs/squawkptt.log</string>
 	<key>EnvironmentVariables</key>

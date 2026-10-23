@@ -1,5 +1,51 @@
 # Changelog
 
+## Unreleased
+
+**Fixes three push-to-talk reliability bugs**, all in the SquawkPTT helper's
+event handling:
+
+- **A tapped (not held) Space could land *after* letters typed right behind
+  it** ("fro mthe" instead of "from the"). The synthetic space for a tap was
+  posted with `CGEventPost`, which re-enters the event pipeline from the top
+  asynchronously and can lose the race against the next real keystroke. It is
+  now posted through the event-tap proxy (`CGEventTapPostEvent`), which inserts
+  it at the tap's own position in the stream, so ordering is guaranteed.
+- **Multi-second stalls before listening mode engaged** (and general keyboard
+  lag on Space). The tap callback asked NSWorkspace for the frontmost app — an
+  XPC round-trip — on every Space event, and spawned the squawk CLI inline. A
+  slow answer stalls the entire keyboard and can make macOS disable the tap for
+  timeout. Frontmost-ness is now cached from workspace activation
+  notifications, and all spawns happen off the tap thread.
+- **Sessions stuck in listening mode** (red cursor + mic icon, release does
+  nothing). Three leaks, all closed:
+  - Releasing Space just after the hold threshold could run `ptt-stop` while
+    `ptt-start` (a cold Python interpreter) was still setting up — the stop
+    no-opped and the recorder it was meant to kill started *afterwards*.
+    Subcommands now run strictly in order on a serial queue.
+  - If focus left iTerm mid-hold, or macOS disabled the event tap mid-hold,
+    the helper reset its state without ever issuing `ptt-stop`. Both paths now
+    abandon the hold properly, stopping the recorder.
+  - `squawk ptt-stop` finding no live recording now heals instead of silently
+    no-opping: it kills any orphaned recorder and clears a stranded indicator.
+
+- **Multi-second delays on a busy machine** before the start cue, the
+  "thinking" glyph, and delivery. The LaunchAgent had no `ProcessType`, so
+  launchd throttled the helper and every process it spawns (python, sox,
+  afplay, osascript); under heavy load each step took seconds instead of
+  ~0.3 s. The agent now runs as `ProcessType = Interactive`.
+
+- **The start and release cues are now instant, even under load.** They were
+  played by the squawk CLI, so each one waited on a Python launch plus an
+  `afplay` exec. SquawkPTT now preloads both sounds and plays them itself the
+  moment the hold registers or Space comes up; the CLI skips them when
+  `SQUAWK_HELPER_CUES=1` is set (an older helper still gets them from the CLI).
+
+**Upgrading:** this changes `helper/squawkptt.m`, so run `squawk install-agent`
+after upgrading and expect macOS to re-prompt for the helper's
+Microphone / Accessibility / Input Monitoring grants (the rebuilt binary has a
+new code hash).
+
 ## v0.1.3 — 2026-07-25
 
 **Visual mode indicator.** Until now the only feedback was sounds, which left

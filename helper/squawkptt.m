@@ -26,12 +26,14 @@
 #import <AppKit/AppKit.h>
 #import <ApplicationServices/ApplicationServices.h>
 
+#include <errno.h>
 #include <limits.h>
 #include <signal.h>
 #include <spawn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 extern char **environ;
@@ -99,10 +101,20 @@ static uint64_t g_hold_gen = 0;
  * so running `squawk migrate` clears it without restarting the helper. */
 static BOOL g_conflict = NO;
 
-/* Fire-and-forget: spawn `squawk <subcommand>` and return immediately. Never
- * block the event-tap callback — a slow callback trips kCGEventTapDisabledBy-
- * Timeout. squawk itself detaches sox and the transcription worker. SIGCHLD is
- * SIG_IGN (set in main), so the kernel reaps these with no zombies. */
+/* Serial queue for squawk subcommand runs. Serialization is load-bearing: a
+ * quick release right after the hold threshold used to spawn ptt-stop while
+ * ptt-start (a cold Python interpreter) was still setting up its lock file —
+ * the stop no-opped, the recorder it was meant to kill started *afterwards*,
+ * and the session sat stuck in listening mode until the recording cap. Running
+ * every subcommand to completion, in order, on one queue makes that race
+ * impossible. Created in main before the tap can fire. */
+static dispatch_queue_t g_squawk_queue;
+
+/* Run `squawk <subcommand>` off the event-tap thread and return immediately —
+ * never block the tap callback, a slow callback trips kCGEventTapDisabledBy-
+ * Timeout. Each subcommand is waited on (squawk itself detaches sox and the
+ * transcription worker, so these exit in well under a second) purely so the
+ * next one cannot overtake it. */
 static void run_squawk(const char *subcommand) {
     if (!squawk_path[0]) {
         fprintf(stderr, "squawkptt: cannot run `squawk %s` — no CLI was found at "
@@ -110,30 +122,100 @@ static void run_squawk(const char *subcommand) {
                 subcommand);
         return;
     }
-    char *argv[] = {squawk_path, (char *)subcommand, NULL};
-    pid_t pid;
-    if (posix_spawn(&pid, squawk_path, NULL, NULL, argv, environ) != 0)
-        perror("squawkptt: posix_spawn squawk");
+    dispatch_async(g_squawk_queue, ^{
+        char *argv[] = {squawk_path, (char *)subcommand, NULL};
+        pid_t pid;
+        if (posix_spawn(&pid, squawk_path, NULL, NULL, argv, environ) != 0) {
+            perror("squawkptt: posix_spawn squawk");
+            return;
+        }
+        int status;
+        while (waitpid(pid, &status, 0) < 0 && errno == EINTR)
+            ;
+    });
+}
+
+/* The start and release cues, preloaded at launch and played by the helper
+ * itself, the instant the hold threshold is crossed or Space comes up. They
+ * used to be played by the squawk CLI, so every cue waited on a cold Python
+ * interpreter plus an afplay exec — two process launches that, on a loaded
+ * machine, turned an instant cue into a multi-second one. A resident process
+ * playing an already-decoded sound has no launch on the path at all. The CLI
+ * is told via SQUAWK_HELPER_CUES (set in main, inherited by every spawn) so it
+ * does not play them a second time. */
+static NSSound *g_cue_start;
+static NSSound *g_cue_release;
+
+/* Even a warm -play costs 10-50 ms on a loaded machine, which must not be spent
+ * inside the tap callback (the whole keyboard waits on it). Queued to the main
+ * queue instead, it runs the moment the callback returns. */
+static void play_cue(NSSound *cue) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        /* stop first: a cue still sounding from a fast tap-hold-tap would
+         * otherwise make -play a no-op. */
+        [cue stop];
+        [cue play];
+    });
+}
+
+/* The first -play in a process sets up the audio output (~200-300 ms,
+ * measured). Pay that once at launch with a muted play, not on the first hold. */
+static void warm_cue(NSSound *cue) {
+    cue.volume = 0;
+    [cue play];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 600 * NSEC_PER_MSEC),
+                   dispatch_get_main_queue(), ^{
+        [cue stop];
+        cue.volume = 1;
+    });
 }
 
 /* Post a genuine Space keypress (down+up) for a tap we swallowed, marked so the
- * tap ignores it. */
-static void synthesize_space(void) {
+ * tap ignores it. Posted through the tap proxy, NOT CGEventPost: proxy posting
+ * inserts the pair at this tap's own position in the event stream, so it stays
+ * ordered before any key event the tap has not processed yet. CGEventPost
+ * re-enters the pipeline from the top asynchronously, and a letter typed right
+ * after the tap could overtake the space — the "space arrives after the next
+ * letter" bug. */
+static void synthesize_space(CGEventTapProxy proxy) {
     CGEventSourceRef src = CGEventSourceCreate(kCGEventSourceStateHIDSystemState);
     CGEventRef down = CGEventCreateKeyboardEvent(src, (CGKeyCode)KEYCODE_SPACE, true);
     CGEventRef up = CGEventCreateKeyboardEvent(src, (CGKeyCode)KEYCODE_SPACE, false);
     CGEventSetIntegerValueField(down, kCGEventSourceUserData, SQUAWK_EVENT_MARKER);
     CGEventSetIntegerValueField(up, kCGEventSourceUserData, SQUAWK_EVENT_MARKER);
-    CGEventPost(kCGHIDEventTap, down);
-    CGEventPost(kCGHIDEventTap, up);
+    CGEventTapPostEvent(proxy, down);
+    CGEventTapPostEvent(proxy, up);
     if (down) CFRelease(down);
     if (up) CFRelease(up);
     if (src) CFRelease(src);
 }
 
-static BOOL frontmost_is_iterm(void) {
-    NSRunningApplication *app = [[NSWorkspace sharedWorkspace] frontmostApplication];
+/* Whether iTerm is the frontmost app, maintained from NSWorkspace activation
+ * notifications on the main thread (same thread as the tap callback, so no
+ * locking). The tap callback used to ask NSWorkspace directly on every Space
+ * event; that is an XPC round-trip, and a slow answer stalls the whole
+ * keyboard and can trip kCGEventTapDisabledByTimeout — the source of the
+ * multi-second "nothing happens" delays. */
+static BOOL g_iterm_front = NO;
+
+static BOOL app_is_iterm(NSRunningApplication *app) {
     return [app.bundleIdentifier isEqualToString:@"com.googlecode.iterm2"];
+}
+
+/* Abandon any in-flight hold, issuing ptt-stop if recording actually started.
+ * Called whenever the helper can no longer trust that it will see the Space
+ * release (focus left iTerm, the tap was disabled, a conflict appeared).
+ * Without the ptt-stop, sox kept recording and the session stayed stuck in
+ * listening mode (red cursor + mic icon) with releases doing nothing. */
+static void abandon_hold(const char *why) {
+    if (g_recording) {
+        fprintf(stderr, "squawkptt: stopping in-flight recording (%s)\n", why);
+        play_cue(g_cue_release);
+        run_squawk("ptt-stop");
+    }
+    g_armed = NO;
+    g_recording = NO;
+    g_hold_gen++;
 }
 
 /* True if karabiner.json still carries the legacy squawk/vox Space rule. The
@@ -179,15 +261,18 @@ static BOOL legacy_rule_active(void) {
 
 static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
                                CGEventRef event, void *refcon) {
-    (void)proxy;
     (void)refcon;
 
     /* macOS disabled the tap (our callback was too slow, or user input raced):
-     * re-enable it so hold-to-talk keeps working without a restart. */
+     * re-enable it so hold-to-talk keeps working without a restart. While the
+     * tap was down every event passed through unseen — including, possibly, the
+     * Space release of a hold in flight — so any such hold must be abandoned
+     * now or the recording runs on with no way to stop it. */
     if (type == kCGEventTapDisabledByTimeout ||
         type == kCGEventTapDisabledByUserInput) {
         if (g_tap)
             CGEventTapEnable(g_tap, true);
+        abandon_hold("event tap was disabled");
         return event;
     }
 
@@ -204,10 +289,11 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
 
     /* Only alter Space in iTerm, and never while the legacy rule could also be
      * grabbing it. Any other context is passed through completely unmodified. */
-    if (g_conflict || !frontmost_is_iterm()) {
-        /* Reset any half-started hold if focus left iTerm mid-press. */
-        g_armed = NO;
-        g_recording = NO;
+    if (g_conflict || !g_iterm_front) {
+        /* Focus left iTerm mid-press (or a conflict appeared): abandon the
+         * hold, stopping the recorder if one was already running. */
+        if (g_armed || g_recording)
+            abandon_hold("focus left iTerm mid-press");
         return event;
     }
 
@@ -225,6 +311,7 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
             if (g_armed && !g_recording && gen == g_hold_gen) {
                 g_armed = NO;
                 g_recording = YES;
+                play_cue(g_cue_start); /* before the spawn: the ack never waits */
                 run_squawk("ptt-start");
             }
         });
@@ -235,6 +322,7 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
     if (g_recording) {
         g_recording = NO;
         g_hold_gen++;
+        play_cue(g_cue_release);
         run_squawk("ptt-stop");
         return NULL;
     }
@@ -243,7 +331,7 @@ static CGEventRef tap_callback(CGEventTapProxy proxy, CGEventType type,
          * the generation bump) and emit a real space. */
         g_armed = NO;
         g_hold_gen++;
-        synthesize_space();
+        synthesize_space(proxy);
         return NULL;
     }
     return event; /* a Space up we never swallowed the down for — leave it */
@@ -312,8 +400,42 @@ int main(void) {
                         "Re-run `squawk install-agent` to record the right path.\n",
                 home);
 
-    /* Non-blocking child spawns with no zombies: let the kernel reap them. */
-    signal(SIGCHLD, SIG_IGN);
+    /* Every squawk child is spawned and reaped on this serial queue (see
+     * run_squawk) — no SIGCHLD/SIG_IGN needed, and ptt-start / ptt-stop can
+     * never overtake each other. */
+    g_squawk_queue = dispatch_queue_create("sh.squawk.ptt.spawn", DISPATCH_QUEUE_SERIAL);
+
+    /* Same files the CLI used to play (SOUND_START / SOUND_ACK in squawk.py). */
+    g_cue_start = [[NSSound alloc] initWithContentsOfFile:@"/System/Library/Sounds/Pop.aiff"
+                                              byReference:YES];
+    g_cue_release = [[NSSound alloc] initWithContentsOfFile:@"/System/Library/Sounds/Ping.aiff"
+                                                byReference:YES];
+    if (!g_cue_start || !g_cue_release)
+        fprintf(stderr, "squawkptt: could not load cue sounds — holds will be silent\n");
+    warm_cue(g_cue_start);
+    warm_cue(g_cue_release);
+    /* Inherited by every spawned squawk: it skips the cues played above. */
+    setenv("SQUAWK_HELPER_CUES", "1", 1);
+
+    /* Track iTerm frontmost-ness from activation notifications instead of
+     * querying NSWorkspace inside the tap callback (see g_iterm_front). A
+     * deactivation mid-hold also has to abandon the hold here, because Space's
+     * release will be delivered to whatever app took focus. */
+    NSWorkspace *workspace = [NSWorkspace sharedWorkspace];
+    g_iterm_front = app_is_iterm(workspace.frontmostApplication);
+    [[workspace notificationCenter]
+        addObserverForName:NSWorkspaceDidActivateApplicationNotification
+                    object:nil
+                     queue:[NSOperationQueue mainQueue]
+                usingBlock:^(NSNotification *note) {
+        NSRunningApplication *app = note.userInfo[NSWorkspaceApplicationKey];
+        BOOL front = app_is_iterm(app);
+        if (front == g_iterm_front)
+            return;
+        g_iterm_front = front;
+        if (!front && (g_armed || g_recording))
+            abandon_hold("iTerm deactivated mid-press");
+    }];
 
     g_hold_ms = read_hold_ms();
     fprintf(stderr, "squawkptt: hold threshold %.0f ms\n", g_hold_ms);

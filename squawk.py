@@ -261,6 +261,14 @@ def log(message):
     print(f"squawk {ts}: {message}", file=sys.stderr)
 
 
+def helper_plays_cues():
+    # SquawkPTT plays the start/release cues itself, from preloaded sounds, the
+    # moment the key event happens — no process launch on the path. It marks
+    # every spawn with this variable so the CLI does not play them twice. An
+    # older helper (or a manual ptt-start) leaves it unset and the CLI plays them.
+    return os.environ.get("SQUAWK_HELPER_CUES") == "1"
+
+
 def play_sound(path):
     try:
         subprocess.Popen(["afplay", path], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -805,7 +813,8 @@ def cmd_ptt_start(cfg):
     # the frontmost application.
     session = os.environ.get("ITERM_SESSION_ID", "").split(":", 1)[-1]
     log(f"ptt-start: recording (sox pid={proc.pid}) -> {raw_path}")
-    play_sound(SOUND_START)
+    if not helper_plays_cues():
+        play_sound(SOUND_START)
 
     # Only now resolve the session tty. Under push-to-talk this costs an
     # osascript round-trip (~200 ms), so it deliberately happens AFTER sox is
@@ -828,9 +837,15 @@ def cmd_ptt_stop(cfg, keep_audio=False, keep_newlines=False):
     # worker), then return at once. If nothing was recording, silently no-op.
     pid, raw_path, session, tty = read_lock()
     if not pid or not pid_alive(pid):
-        # Nothing was recording (e.g. a plain space tap) — silent no-op, and
-        # nothing was painted either, so there is nothing to clear.
+        # The helper believed a recording was in flight but there is no live
+        # lock — a crashed ptt-start, a helper restart mid-hold, or residue
+        # from an older race. Heal instead of no-opping: make sure no orphaned
+        # recorder keeps the mic, and clear any indicator stranded in the
+        # session the lock still points at (or the frontmost one), so the red
+        # cursor / mic icon can never outlive the recording.
         release_lock()
+        kill_stale_recorders()
+        clear_indicator(cfg, tty or resolve_session_tty())
         return 0
 
     # Releasing Space is deliberate: you stopped talking, so stop NOW. SIGKILL
@@ -838,7 +853,8 @@ def cmd_ptt_stop(cfg, keep_audio=False, keep_newlines=False):
     # in — it dies instantly. That is safe only because we capture raw PCM (no
     # WAV header to finalize), so the bytes already on disk are complete audio.
     log(f"ptt-stop: release -> SIGKILL sox pid={pid}")
-    play_sound(SOUND_ACK)  # immediate "released, on it" cue
+    if not helper_plays_cues():
+        play_sound(SOUND_ACK)  # immediate "released, on it" cue
     # The tty was resolved at ptt-start, so this is a single free write — the
     # "thinking" glyph appears the moment Space comes up, which is the whole
     # point of the feature: the 1-3 s transcription gap becomes visible.
